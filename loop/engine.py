@@ -143,6 +143,7 @@ class Engine:
             row = self.db.execute("SELECT * FROM tasks WHERE run_id=? AND id=?",
                                   (plan["id"], task["id"])).fetchone()
             if row["status"] == "done":
+                git(workspace, "merge-base", "--is-ancestor", row["sha"], "HEAD")
                 continue
             if row["status"] == "blocked":
                 return "blocked", 0
@@ -154,7 +155,7 @@ class Engine:
             # Reconcile a crash after git commit but before the database transaction.
             sha = git(workspace, "log", run["base"]+"..HEAD", "--format=%H", "--fixed-strings",
                       "--grep="+marker, "-1")
-            if sha:
+            if sha and not row["error"].startswith("Milestone regression:"):
                 self.set_task(plan["id"], task["id"], status="done", sha=sha)
                 continue
             provider = self.db.execute("SELECT * FROM providers WHERE name=?", (task["provider"],)).fetchone()

@@ -3,10 +3,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from loop.adapters import Result, command, parse, quota_deadline, run_process, token_total
 from loop.engine import Engine, git, safe_path
-from loop.release import checks_pass, validate_remote
+from loop.release import checks_pass, publish, validate_remote
 
 
 class AdapterTests(unittest.TestCase):
@@ -149,6 +150,67 @@ class EngineTests(unittest.TestCase):
         self.plan["tasks"][0]["prompt"] = "different"
         with self.assertRaises(ValueError):
             self.engine.initialize(self.plan)
+
+    def test_milestone_rechecks_earlier_sections(self):
+        self.plan["tasks"].append({"id":"two", "provider":"claude", "files":["answer.py"],
+                                   "prompt":"change answer", "check":["python3","-c","pass"]})
+        self.engine.tick(self.plan, self.good_worker)
+        def regressing(*_):
+            return Result("ok", '{"files":[{"path":"answer.py","content":"def add(a,b): return 0"}]}')
+        self.engine.tick(self.plan, regressing)
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "blocked")
+        row = self.engine.status()["tasks"][0]
+        self.assertIn("Milestone regression", row["error"])
+        self.engine.set_task("test", "one", status="pending", attempts=0)
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "progress")
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "ready_for_pr")
+
+    def test_unrelated_worktree_edits_are_preserved(self):
+        run = self.engine.initialize(self.plan)
+        unrelated = Path(run["workspace"]) / "user-note.txt"
+        unrelated.write_text("keep me")
+        with self.assertRaises(RuntimeError):
+            self.engine.tick(self.plan, self.good_worker)
+        self.assertEqual(unrelated.read_text(), "keep me")
+        self.assertEqual(self.calls, 0)
+
+    def test_release_checks_and_exact_sha_with_simulated_github(self):
+        self.engine.tick(self.plan, self.good_worker)
+        self.engine.tick(self.plan, self.good_worker)
+        sha = self.engine.status()["tasks"][0]["sha"]
+        calls = []
+        merged = False
+        pr = {"number":1, "state":"OPEN", "headRefOid":sha, "url":"https://github.com/test/demo/pull/1"}
+        def fake_git(repo, *args):
+            calls.append(("git", *args))
+            if args[:2] == ("remote", "get-url"):
+                return "https://github.com/test/demo.git"
+            if args[0] == "rev-parse":
+                return sha
+            return ""
+        def fake_gh(repo, *args):
+            nonlocal merged
+            calls.append(("gh", *args))
+            if args[:2] == ("pr", "list"):
+                return json.dumps([dict(pr, state="MERGED" if merged else "OPEN")])
+            if args[:2] == ("pr", "merge"):
+                merged = True
+                self.assertIn("--match-head-commit", args)
+                self.assertIn(sha, args)
+                self.assertNotIn("--admin", args)
+                return ""
+            return json.dumps(dict(pr, state="MERGED" if merged else "OPEN"))
+        with patch("loop.release.git", side_effect=fake_git), patch("loop.release.gh", side_effect=fake_gh), \
+                patch("loop.release.subprocess.check_output", return_value="true"), \
+                patch("loop.release.subprocess.run") as check:
+            check.return_value = subprocess.CompletedProcess([], 0, '[]', '')
+            self.assertEqual(publish(self.engine,"test","test/demo",merge=True)["state"], "waiting_for_checks")
+            self.assertFalse(merged)
+            check.return_value = subprocess.CompletedProcess([], 0, '[{"bucket":"pass"}]', '')
+            self.assertEqual(publish(self.engine,"test","test/demo",merge=True)["state"], "merged")
+            count = len(calls)
+            self.assertEqual(publish(self.engine,"test","test/demo",merge=True)["state"], "merged")
+            self.assertFalse(any(call[:2] == ("git","push") for call in calls[count:]))
 
 
 if __name__ == "__main__":
