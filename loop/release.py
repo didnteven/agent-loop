@@ -24,7 +24,7 @@ def validate_remote(url, repository):
         raise ValueError("origin does not match the explicitly selected GitHub repository")
 
 
-def publish(engine, run_id, repository, base="main", merge=False):
+def publish(engine, run_id, repository, base="main", merge=False, review=False):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Use OWNER/REPOSITORY")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", base) or ".." in base:
@@ -64,6 +64,12 @@ def publish(engine, run_id, repository, base="main", merge=False):
     git(engine.repo, "fetch", "origin", base)
     fetched_base = git(engine.repo, "rev-parse", "FETCH_HEAD")
     git(workspace, "merge-base", "--is-ancestor", fetched_base, "HEAD")
+    if review:
+        from .review import review_pr
+        verdict = review_pr(plan.get("review_provider", "claude"), plan.get("review_model"),
+                             plan, workspace, fetched_base, plan.get("worker_timeout_seconds", 180))
+        if not verdict["approved"]:
+            raise ValueError("PR review declined publication: " + "; ".join(verdict["concerns"]))
     git(workspace, "push", "origin", "HEAD:refs/heads/" + run["branch"])
     engine.prepare_pr(plan, run)
     if not prs:

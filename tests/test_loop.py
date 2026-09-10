@@ -8,6 +8,7 @@ from unittest.mock import patch
 from loop.adapters import Result, command, parse, quota_deadline, run_process, token_total
 from loop.engine import Engine, git, safe_path
 from loop.release import checks_pass, publish, validate_remote
+from loop.review import review_plan
 
 
 class AdapterTests(unittest.TestCase):
@@ -56,12 +57,28 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_remote("https://github.com/todd/production.git", "todd/test")
 
+    def test_review_parses_declined_verdict(self):
+        with patch("loop.review.run_process",
+                   return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
+                                    '"result":"{\\"approved\\": false, \\"concerns\\": [\\"fabricated\\"]}"}', "")):
+            verdict = review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
+        self.assertFalse(verdict["approved"])
+        self.assertEqual(verdict["concerns"], ["fabricated"])
+
+    def test_review_rejects_response_without_verdict(self):
+        with patch("loop.review.run_process",
+                   return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
+                                    '"result":"not json"}', "")):
+            with self.assertRaises(RuntimeError):
+                review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
+
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.repo = Path(self.temp.name)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        git(self.repo, "checkout", "-q", "-B", "main")
         git(self.repo, "config", "user.name", "Test")
         git(self.repo, "config", "user.email", "test@example.invalid")
         (self.repo / ".gitignore").write_text(".agent-loop/\n__pycache__/\n")

@@ -18,6 +18,8 @@ def main():
     run = sub.add_parser("run")
     run.add_argument("plan")
     run.add_argument("--once", action="store_true", help="One scheduler tick; no waiting")
+    run.add_argument("--review", action="store_true",
+                      help="Self-review the plan before starting; abort if declined")
     sub.add_parser("status")
     sub.add_parser("codex-quota")
     release = sub.add_parser("publish", help="Explicitly push a milestone and create/reuse its PR")
@@ -25,6 +27,8 @@ def main():
     release.add_argument("--github", required=True, help="Exact OWNER/REPOSITORY matching origin")
     release.add_argument("--base", default="main")
     release.add_argument("--merge", action="store_true", help="Merge only with protected base and passing required checks")
+    release.add_argument("--review", action="store_true",
+                          help="Self-review the diff against task prompts before publishing; abort if declined")
     hold = sub.add_parser("hold", help="Record an observed provider reset time")
     hold.add_argument("provider", choices=["codex", "claude", "antigravity"])
     hold.add_argument("--until", type=float, required=True, help="Unix timestamp; 0 clears the hold")
@@ -42,7 +46,7 @@ def main():
         elif args.command == "publish":
             from .release import publish
             with engine.lock():
-                result = publish(engine, args.run_id, args.github, args.base, args.merge)
+                result = publish(engine, args.run_id, args.github, args.base, args.merge, args.review)
                 engine.event(args.run_id, "release", result["state"], result)
         elif args.command == "hold":
             engine.hold(args.provider, args.until, args.reason)
@@ -56,6 +60,14 @@ def main():
         else:
             plan = json.loads(Path(args.plan).read_text())
             with engine.lock():
+                if args.review and not engine.db.execute(
+                        "SELECT 1 FROM runs WHERE id=?", (plan.get("id"),)).fetchone():
+                    from .review import review_plan
+                    verdict = review_plan(plan.get("review_provider", "claude"), plan.get("review_model"),
+                                          plan, engine.repo, plan.get("worker_timeout_seconds", 180))
+                    if not verdict["approved"]:
+                        print(json.dumps({"state": "review_declined", "concerns": verdict["concerns"]}))
+                        return 2
                 while True:
                     state, deadline = engine.tick(plan)
                     if args.once or state == "ready_for_pr":
