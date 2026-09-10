@@ -27,6 +27,8 @@ def validate_remote(url, repository):
 def publish(engine, run_id, repository, base="main", merge=False, review=False):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Use OWNER/REPOSITORY")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", str(run_id)):
+        raise ValueError("Invalid milestone id")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", base) or ".." in base:
         raise ValueError("Invalid base branch")
     run = engine.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -61,8 +63,12 @@ def publish(engine, run_id, repository, base="main", merge=False, review=False):
             raise ValueError("Release verification failed: " + (out+err)[-3000:])
     if git(workspace, "status", "--porcelain"):
         raise ValueError("Release checks changed tracked or unignored files")
-    git(engine.repo, "fetch", "origin", base)
-    fetched_base = git(engine.repo, "rev-parse", "FETCH_HEAD")
+    # FETCH_HEAD is shared repository state; fetch into a ref private to this milestone
+    # so a concurrent publication cannot substitute its own base commit here.
+    private_base = "refs/agent-loop/base/" + run_id
+    with engine.repo_lock():
+        git(engine.repo, "fetch", "--force", "origin", base + ":" + private_base)
+    fetched_base = git(engine.repo, "rev-parse", private_base)
     git(workspace, "merge-base", "--is-ancestor", fetched_base, "HEAD")
     if review:
         from .review import review_pr

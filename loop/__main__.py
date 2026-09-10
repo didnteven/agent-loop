@@ -45,13 +45,13 @@ def main():
             print(json.dumps(codex_limits(Path(args.repo)), indent=2))
         elif args.command == "publish":
             from .release import publish
-            with engine.lock():
+            with engine.run_lock(args.run_id):
                 result = publish(engine, args.run_id, args.github, args.base, args.merge, args.review)
                 engine.event(args.run_id, "release", result["state"], result)
         elif args.command == "hold":
             engine.hold(args.provider, args.until, args.reason)
         elif args.command == "retry":
-            with engine.lock():
+            with engine.run_lock(args.run_id):
                 row = engine.db.execute("SELECT status FROM tasks WHERE run_id=? AND id=?",
                                         (args.run_id, args.task_id)).fetchone()
                 if not row or row["status"] == "done":
@@ -59,7 +59,7 @@ def main():
                 engine.set_task(args.run_id, args.task_id, status="pending", attempts=0, retry_at=0)
         else:
             plan = json.loads(Path(args.plan).read_text())
-            with engine.lock():
+            with engine.run_lock(plan.get("id", "")):
                 if args.review and not engine.db.execute(
                         "SELECT 1 FROM runs WHERE id=?", (plan.get("id"),)).fetchone():
                     from .review import review_plan
