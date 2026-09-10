@@ -73,6 +73,29 @@ Optional per-task fields:
 - `context_files`: list of paths (relative to the workspace) whose current contents (first 30000 chars each) get appended to the prompt as read-only context — use for files earlier tasks produced that a later task should build on.
 - `quota_bucket`: which Codex rate-limit bucket to preflight-check (default `"codex"`), only relevant when `provider` is `codex`.
 
+## Checking provider usage before assigning `provider` per task
+
+Before deciding which provider each task should use, check current usage/quota for all three and prefer the provider(s) with the most headroom. Do this every time a plan is authored, not just on request.
+
+1. **Codex** — 7-day and 5h windows, no auth prompt required:
+   ```sh
+   python3 -m loop --repo <target-repo> codex-quota
+   ```
+   Read `rateLimits.secondary.usedPercent` (7-day window) and `.primary.usedPercent` (5h window).
+2. **Claude** — session and 7-day usage:
+   ```sh
+   claude -p "/usage"
+   ```
+   Read the "Current week (all models)" line for the 7-day figure.
+3. **Antigravity** — no official headless CLI is installed by default; the open-source `antigravity-usage` tool (github.com/skainguyen1412/antigravity-usage, MIT) reads quota from the local Antigravity language server if the Antigravity app is running:
+   ```sh
+   cd /tmp && git clone --depth 1 https://github.com/skainguyen1412/antigravity-usage.git && cd antigravity-usage && npm install
+   npx tsx src/index.ts quota
+   ```
+   If it reports "Antigravity is not running", launch the app first (`open -a "Antigravity"`, wait a few seconds for `language_server` to start) and retry. This is third-party code hitting your local process, not a remote API — confirm with the user before installing/running it the first time in a session.
+
+Rank providers by ascending "used%" on their longest available window (prefer an untouched/lowest-used window over one closer to its cap), then by soonest-resetting window as a tiebreak. Assign tasks in the plan to providers in that order — put the heaviest/most numerous tasks on whichever provider has the most headroom, and avoid a provider whose relevant window is nearly exhausted unless no alternative fits the task (e.g. it needs a model only that provider offers). Note the chosen ranking and the raw numbers in the plan `description` or in your response to the user so the reasoning is visible.
+
 ## Task ordering and dependencies
 
 Tasks run **sequentially** in array order within one `tick`. A task can only rely on files from earlier tasks in the same plan (list them in `context_files`); there is no parallel fan-out inside one plan. For independent, unrelated pieces of work, list them as separate tasks with disjoint `files` — order won't matter for those, but they still run one at a time.
