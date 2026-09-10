@@ -2,6 +2,7 @@
 import fcntl
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -35,6 +36,13 @@ def safe_path(root, name):
     return target
 
 
+def check_budget(budget):
+    if budget is None:
+        return
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        raise ValueError("Token budgets must be non-negative integers")
+
+
 def validate_plan(plan):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", plan["id"]):
         raise ValueError("Plan id must be a short lowercase slug")
@@ -51,8 +59,16 @@ def validate_plan(plan):
             safe_path(Path.cwd(), name)
         if not isinstance(task.get("check"), list) or not task["check"]:
             raise ValueError("Every task needs a trusted check argv")
+        check_budget(task.get("token_budget"))
     if not ids:
         raise ValueError("Plan needs tasks")
+    budgets = plan.get("provider_token_budgets", {})
+    if not isinstance(budgets, dict):
+        raise ValueError("provider_token_budgets must be an object")
+    for provider, budget in budgets.items():
+        if provider not in ("codex", "claude", "antigravity"):
+            raise ValueError("Unsupported provider in provider_token_budgets")
+        check_budget(budget)
 
 
 class Engine:
@@ -60,16 +76,21 @@ class Engine:
         self.repo = Path(repo).resolve()
         self.home = self.repo / ".agent-loop"
         self.home.mkdir(exist_ok=True)
+        self.holding_repo_lock = False
+        self.locks = self.home / "locks"
+        self.locks.mkdir(exist_ok=True)
         self.db = sqlite3.connect(self.home / "state.sqlite", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
+            PRAGMA busy_timeout=10000;
             CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY, plan TEXT NOT NULL, digest TEXT NOT NULL,
                 workspace TEXT NOT NULL, branch TEXT NOT NULL, base TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks (
                 run_id TEXT, id TEXT, status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0,
                 retry_at REAL DEFAULT 0, sha TEXT, error TEXT DEFAULT '',
+                tokens INTEGER DEFAULT 0,
                 PRIMARY KEY(run_id,id));
             CREATE TABLE IF NOT EXISTS providers (
                 name TEXT PRIMARY KEY, retry_at REAL DEFAULT 0, reason TEXT DEFAULT '',
@@ -77,21 +98,57 @@ class Engine:
             CREATE TABLE IF NOT EXISTS events (
                 at REAL, run_id TEXT, task_id TEXT, kind TEXT, detail TEXT);
         """)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(tasks)")}
+        if "tokens" not in columns:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN tokens INTEGER DEFAULT 0")
         for name in ("codex", "claude", "antigravity"):
             self.db.execute("INSERT OR IGNORE INTO providers(name) VALUES (?)", (name,))
         self.db.commit()
 
     @contextmanager
-    def lock(self):
-        with (self.home / "supervisor.lock").open("w") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("Another supervisor is active for this repository")
+    def lock(self, name="repo", wait=0.0, message="Another supervisor is active for this repository"):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,70}", name):
+            raise ValueError("Invalid lock name")
+        with (self.locks / (name + ".lock")).open("w") as handle:
+            # Non-blocking with a bounded wait: a held lock must never hang a supervisor.
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(message)
+                    time.sleep(0.05)
             try:
                 yield
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def run_lock(self, run_id):
+        """Exclude only supervisors of the same milestone; distinct plans run concurrently."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", str(run_id)):
+            raise ValueError("Invalid milestone id")
+        return self.lock("run-" + run_id,
+                         message="Another supervisor is active for milestone " + run_id)
+
+    @contextmanager
+    def repo_lock(self):
+        """Serialize the few operations that mutate shared repository state.
+
+        Held only around git plumbing, never across a sleep or a model call, so the
+        ordering run lock then repo lock cannot deadlock.
+        """
+        if self.holding_repo_lock:
+            yield
+            return
+        self.holding_repo_lock = True
+        try:
+            with self.lock("repo", wait=30.0,
+                           message="Timed out waiting for shared repository access"):
+                yield
+        finally:
+            self.holding_repo_lock = False
 
     def event(self, run_id, task, kind, detail):
         self.db.execute("INSERT INTO events VALUES (?,?,?,?,?)",
@@ -108,24 +165,39 @@ class Engine:
             if existing["digest"] != digest:
                 raise ValueError("Plan changed: use a new id, or restore the original plan")
             return existing
-        if git(self.repo, "status", "--porcelain"):
-            raise RuntimeError("Commit the target repository before starting a new milestone")
-        base = git(self.repo, "rev-parse", "HEAD")
-        branch = "loop/" + plan["id"]
-        workspace = self.home / "worktrees" / plan["id"]
-        workspace.parent.mkdir(exist_ok=True)
-        git(self.repo, "worktree", "add", "-b", branch, str(workspace), base)
-        self.db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?)",
-                        (plan["id"], encoded, digest, str(workspace), branch, base))
-        for task in plan["tasks"]:
-            self.db.execute("INSERT INTO tasks(run_id,id) VALUES (?,?)", (plan["id"], task["id"]))
-        self.db.commit()
-        return self.db.execute("SELECT * FROM runs WHERE id=?", (plan["id"],)).fetchone()
+        with self.repo_lock():
+            existing = self.db.execute("SELECT * FROM runs WHERE id=?", (plan["id"],)).fetchone()
+            if existing:
+                if existing["digest"] != digest:
+                    raise ValueError("Plan changed: use a new id, or restore the original plan")
+                return existing
+            if git(self.repo, "status", "--porcelain"):
+                raise RuntimeError("Commit the target repository before starting a new milestone")
+            base = git(self.repo, "rev-parse", "HEAD")
+            branch = "loop/" + plan["id"]
+            workspace = self.home / "worktrees" / plan["id"]
+            workspace.parent.mkdir(exist_ok=True)
+            git(self.repo, "worktree", "add", "-b", branch, str(workspace), base)
+            self.db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?)",
+                            (plan["id"], encoded, digest, str(workspace), branch, base))
+            for task in plan["tasks"]:
+                self.db.execute("INSERT INTO tasks(run_id,id) VALUES (?,?)", (plan["id"], task["id"]))
+            self.db.commit()
+            return self.db.execute("SELECT * FROM runs WHERE id=?", (plan["id"],)).fetchone()
 
     def set_task(self, run_id, task_id, **fields):
         self.db.execute("UPDATE tasks SET " + ",".join(k+"=?" for k in fields)
                         + " WHERE run_id=? AND id=?", (*fields.values(), run_id, task_id))
         self.db.commit()
+
+    def run_tokens(self, plan, provider):
+        ids = [task["id"] for task in plan["tasks"] if task["provider"] == provider]
+        if not ids:
+            return 0
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(tokens),0) AS total FROM tasks WHERE run_id=? AND id IN ("
+            + ",".join("?" * len(ids)) + ")", (plan["id"], *ids)).fetchone()
+        return row["total"]
 
     def hold(self, provider, until, reason):
         self.db.execute("UPDATE providers SET retry_at=?,reason=? WHERE name=?",
@@ -163,8 +235,14 @@ class Engine:
             if retry_at > now:
                 return "waiting", retry_at
             budget = plan.get("provider_token_budgets", {}).get(task["provider"])
-            if budget is not None and provider["tokens"] >= budget:
-                self.set_task(plan["id"], task["id"], status="blocked", error="Local admission token budget reached")
+            if budget is not None and self.run_tokens(plan, task["provider"]) >= budget:
+                self.set_task(plan["id"], task["id"], status="blocked",
+                              error="Local admission token budget reached for provider " + task["provider"])
+                return "blocked", 0
+            task_budget = task.get("token_budget")
+            if task_budget is not None and row["tokens"] >= task_budget:
+                self.set_task(plan["id"], task["id"], status="blocked",
+                              error="Local admission token budget reached for this section")
                 return "blocked", 0
             if row["attempts"] >= plan.get("max_attempts", 3):
                 self.set_task(plan["id"], task["id"], status="blocked", error="Repair attempts exhausted")
@@ -177,7 +255,10 @@ class Engine:
                     bucket = task.get("quota_bucket", "codex")
                     selected = limits.get("rateLimitsByLimitId", {}).get(bucket, limits.get("rateLimits", {}))
                     deadline = quota_deadline(selected, now)
-                    (self.home / "codex-quota.json").write_text(json.dumps(limits, indent=2))
+                    snapshot = self.home / "codex-quota.json"
+                    scratch = snapshot.with_suffix(".json." + str(os.getpid()) + ".tmp")
+                    scratch.write_text(json.dumps(limits, indent=2))
+                    os.replace(scratch, snapshot)
                     if deadline:
                         self.hold("codex", deadline, "Provider quota exhausted")
                         return "waiting", deadline
@@ -208,8 +289,11 @@ class Engine:
             except OSError as exc:
                 self.set_task(plan["id"], task["id"], status="blocked", error=str(exc))
                 return "blocked", 0
+            spent = token_total(task["provider"], result.usage)
             self.db.execute("UPDATE providers SET tokens=tokens+?,estimated_usd=estimated_usd+? WHERE name=?",
-                            (token_total(task["provider"], result.usage), result.estimated_usd, task["provider"]))
+                            (spent, result.estimated_usd, task["provider"]))
+            self.db.execute("UPDATE tasks SET tokens=tokens+? WHERE run_id=? AND id=?",
+                            (spent, plan["id"], task["id"]))
             self.db.commit()
             if result.status == "rate_limited":
                 # Unknown reset: probe slowly; this is a retry time, not a claimed reset.

@@ -81,7 +81,7 @@ Keep stage 1 small. A framework becomes more attractive for distributed workers,
 ## Operational limits
 
 - No unattended service is activated by this project setup.
-- Single-repository locking does not coordinate other user-launched agents.
+- Locking is per milestone, not per repository: concurrent milestones are isolated by their own worktrees and by a short repository-wide lock around shared git plumbing. It does not coordinate other user-launched agents, and two plans that declare overlapping `files` will still conflict at merge time rather than while running.
 - Codex quota reads are live; Claude/Antigravity proactive account telemetry is not implemented.
 - The timeout bounds a worker process, but cannot cancel requests already accepted by a remote provider with certainty.
 - Crashes before a model response is durably recorded can cause a repeated request and uncounted partial usage. Git commits are reconciled; model billing is not exactly-once.

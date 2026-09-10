@@ -6,9 +6,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from loop.adapters import Result, command, parse, quota_deadline, run_process, token_total
-from loop.engine import Engine, git, safe_path
+from loop.engine import Engine, git, safe_path, validate_plan
 from loop.release import checks_pass, publish, validate_remote
 from loop.review import review_plan
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKER = Path(__file__).resolve().parent / "concurrent_worker.py"
 
 
 class AdapterTests(unittest.TestCase):
@@ -112,7 +115,7 @@ class EngineTests(unittest.TestCase):
         return Result("ok", json.dumps({"files":[{"path":"answer.py","content":"def add(a,b): return a+b\n"}]}), {"input_tokens":50,"output_tokens":10})
 
     def test_commit_restart_and_pr_body(self):
-        with self.engine.lock():
+        with self.engine.run_lock("test"):
             self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "progress")
         self.engine.db.close()
         self.engine = Engine(self.repo)
@@ -150,15 +153,64 @@ class EngineTests(unittest.TestCase):
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
 
-    def test_single_supervisor_lock(self):
+    def test_one_supervisor_per_milestone_but_not_per_repository(self):
         other = Engine(self.repo)
         try:
-            with self.engine.lock():
+            with self.engine.run_lock("test"):
                 with self.assertRaises(RuntimeError):
-                    with other.lock():
+                    with other.run_lock("test"):
                         pass
+                # A different milestone in the same repository is not excluded.
+                with other.run_lock("second"):
+                    pass
         finally:
             other.db.close()
+
+    def test_concurrent_milestones_share_one_repository(self):
+        plans = []
+        for name in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta"):
+            plan = json.loads(json.dumps(self.plan))
+            plan["id"] = name
+            plan["tasks"][0]["files"] = [name + ".py"]
+            plan["tasks"][0]["check"] = ["python3", "-c",
+                                         "from " + name + " import add; assert add(2,3)==5"]
+            plans.append(plan)
+        workers = [subprocess.Popen(
+            ["python3", str(WORKER), str(self.repo), json.dumps(plan)],
+            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for plan in plans]
+        (self.engine.home / "go").write_text("")
+        results = [worker.communicate() for worker in workers]
+        for plan, (out, err) in zip(plans, results):
+            self.assertEqual(out.strip().splitlines()[-1], "ready_for_pr", err)
+            workspace = self.engine.home / "worktrees" / plan["id"]
+            self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "2")
+            self.assertTrue((workspace / (plan["id"] + ".py")).exists())
+        # Neither milestone leaked into the other's worktree or the shared checkout.
+        self.assertFalse((self.engine.home / "worktrees" / "alpha" / "beta.py").exists())
+        self.assertEqual(len(git(self.repo, "worktree", "list").splitlines()), len(plans) + 1)
+        self.assertFalse((self.repo / "alpha.py").exists())
+
+    def test_token_budgets_are_scoped_to_the_plan_and_the_task(self):
+        self.plan["tasks"][0]["token_budget"] = 40
+        # A concurrent milestone's spend on the same provider must not gate this one.
+        self.engine.db.execute("UPDATE providers SET tokens=1000000000 WHERE name='codex'")
+        self.plan["provider_token_budgets"] = {"codex": 1000}
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "progress")
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.engine.status()["tasks"][0]["tokens"], 60)
+
+    def test_task_budget_is_its_own_admission_gate(self):
+        self.plan["tasks"][0]["token_budget"] = 0
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "blocked")
+        self.assertEqual(self.calls, 0)
+        self.assertIn("this section", self.engine.status()["tasks"][0]["error"])
+
+    def test_plan_budgets_must_be_sane(self):
+        for budget in ({"codex": -1}, {"nowhere": 10}, {"codex": True}, {"codex": 1.5}):
+            plan = dict(self.plan, provider_token_budgets=budget)
+            with self.assertRaises(ValueError):
+                validate_plan(plan)
 
     def test_path_and_response_boundary(self):
         for name in ("../outside", ".git/config", "/tmp/outside", ".agent-loop/state.sqlite"):
