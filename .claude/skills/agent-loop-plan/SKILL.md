@@ -100,6 +100,11 @@ Multi-task / multi-provider plans (e.g. comparing providers, or building sequent
 
 ## Before handing back a plan
 
-1. Confirm the target repo is clean and has at least one commit (`validate_plan`/`initialize` will reject a dirty tree at run time, but check first so the user isn't surprised).
-2. Confirm every `files` entry across all tasks is unique repo-wide if tasks touch overlapping areas — the engine only checks per-task uniqueness, not cross-task overlap, but two tasks racing to touch the same file will make the second task's diff check fail.
-3. Remind the user of the run command: `python3 -m loop --repo <target-repo> run <plan>.json` (add `--once` for a single scheduler tick).
+1. **Cut a fresh branch from freshly-pulled `main` (or the repo's real default branch) first, always** — before writing the plan file or running anything. `Engine.initialize` bases the milestone worktree on whatever commit is currently checked out in the target repo, not on any named branch. If that happens to be a stale or unrelated branch (e.g. leftover work-in-progress), `publish` will later fail its ancestor-of-base check against `origin/main`, and there is no way to rebase an existing run in place — only a brand-new plan `id` can restart from a different base. Do this every time, even if the currently checked-out branch looks fine:
+   ```sh
+   git -C <target-repo> fetch origin main
+   git -C <target-repo> checkout -b <plan-id>-base origin/main
+   ```
+2. Confirm the target repo is clean and has at least one commit (`validate_plan`/`initialize` will reject a dirty tree at run time, but check first so the user isn't surprised). If checking out the new branch surfaces an untracked `.agent-loop/` from a prior run, add `.agent-loop/` to `.gitignore` and commit it — an untracked directory still counts as "dirty" to the clean-tree check.
+3. Confirm every `files` entry across all tasks is unique repo-wide if tasks touch overlapping areas — the engine only checks per-task uniqueness, not cross-task overlap, but two tasks racing to touch the same file will make the second task's diff check fail.
+4. Remind the user of the run command: `python3 -m loop --repo <target-repo> run <plan>.json` (add `--once` for a single scheduler tick), and that `publish` defaults `--base` to `main` — which now matches, because of step 1.
