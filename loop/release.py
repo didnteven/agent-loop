@@ -40,10 +40,10 @@ def publish(engine, run_id, repository, base="main", merge=False):
     if git(workspace, "status", "--porcelain"):
         raise ValueError("Managed worktree is dirty")
     sha = git(workspace, "rev-parse", "HEAD")
-    last_id = plan["tasks"][-1]["id"]
-    expected = next(task["sha"] for task in tasks if task["id"] == last_id)
-    if sha != expected:
+    if sha not in {task["sha"] for task in tasks}:
         raise ValueError("Branch tip differs from the verified milestone commit")
+    for task in tasks:
+        git(workspace, "merge-base", "--is-ancestor", task["sha"], "HEAD")
     validate_remote(git(engine.repo, "remote", "get-url", "origin"), repository)
     prs = json.loads(gh(repository, "pr", "list", "--head", run["branch"], "--base", base,
                         "--state", "all", "--json", "number,state,headRefOid,url"))
@@ -62,7 +62,8 @@ def publish(engine, run_id, repository, base="main", merge=False):
     if git(workspace, "status", "--porcelain"):
         raise ValueError("Release checks changed tracked or unignored files")
     git(engine.repo, "fetch", "origin", base)
-    git(workspace, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD")
+    fetched_base = git(engine.repo, "rev-parse", "FETCH_HEAD")
+    git(workspace, "merge-base", "--is-ancestor", fetched_base, "HEAD")
     git(workspace, "push", "origin", "HEAD:refs/heads/" + run["branch"])
     engine.prepare_pr(plan, run)
     if not prs:
