@@ -61,6 +61,12 @@ Release sequence:
 
 The included `publish` command handles branch push, PR creation/reuse, checks, and exact-head merge when explicitly requested. A real remote was not selected in this conversation, so live GitHub publication is not part of the local smoke test. The current prototype stops at `ready_for_pr` by default. This is not represented as a merged milestone.
 
+## Automation intent
+
+The design goal is that once a plan is authored and started, it runs to completion — implement, check, commit, repeat, publish — without stopping for interactive confirmation at each step. The trusted `check` command in each task *is* the automated review gate: a section is never accepted on a model's say-so, only on a check passing. There is deliberately no additional "please confirm this generated code looks right" prompt inside the supervisor loop itself; that would reintroduce a human bottleneck the design is meant to remove.
+
+This intent has one hard boundary: irreversible, externally visible actions — pushing a branch, opening a PR, merging — are git/GitHub operations, not supervisor state, and remain gated by whatever confirmation layer the calling tool (e.g. Claude Code's own permission system) enforces around `git push`, `gh pr create`, or `gh pr merge`. Agent-loop's own `publish` command does not add its own extra confirmation on top of that; it performs the push/PR/merge sequence directly once invoked, subject to the safety checks in [Commit and PR policy](#commit-and-pr-policy) (ancestor-of-base check, protected branch requirement for `--merge`, exact-head match). If a plan's milestone branch was built off a branch other than the intended PR base, pass the real base explicitly with `--base`; the ancestor check exists to stop a PR from silently landing on the wrong base, not to add a review step.
+
 ## Implementation stages
 
 | Stage | Deliverable | Gate |
