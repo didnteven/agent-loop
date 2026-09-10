@@ -43,6 +43,12 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 | `unknown_quota_retry_seconds` | 1800 | retry delay when a rate-limit has no machine-readable reset |
 | `read_codex_quotas` | true | preflight Codex's app-server quota API before spending a turn |
 | `provider_token_budgets` | none | e.g. `{"codex": 100000}` — local admission cap per provider, counted across this plan's completed responses |
+| `review_provider` | `claude` | which CLI performs optional self-review (see below), only used if `--review` is passed |
+| `review_model` | none | model id for the review call, only used if `--review` is passed |
+
+## Optional self-review (`--review`)
+
+`run --review` runs a model-based sanity check of the plan (are the tasks real/needed, could each `check` plausibly verify its `prompt`) before the first task starts, and aborts before touching the repo if declined. `publish --review` runs a model-based comparison of the finished diff against each task's `prompt`, flagging fabricated/unrelated/unnecessary changes, and aborts before pushing if declined. Both are optional, off by default, and advisory — they never replace the trusted `check` command, which is still the only thing that actually gates a commit. Mention `--review` to the user as an available option when handing back run/publish commands, especially for plans touching anything sensitive.
 
 ## Task object (each entry in `tasks`)
 

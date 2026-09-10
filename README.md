@@ -49,4 +49,8 @@ The first command pushes the milestone branch and creates/reuses its PR. The sec
 
 Run only trusted plans: the acceptance-check commands execute locally. Path restrictions protect file application; they are not an OS sandbox for the acceptance tests. Do not put secrets in prompts or in generated files.
 
+## Optional self-review
+
+`run --review` asks a model to sanity-check the plan itself before the first task runs — whether each task's goal looks real/needed and whether its `check` could plausibly verify its `prompt` — and aborts before touching the repo if it declines. `publish --review` asks a model to compare the finished diff against each task's `prompt` and flag anything fabricated, unrelated, or unnecessary, aborting before the branch is pushed if it declines. Both are optional and off by default; neither replaces or weakens the trusted `check` command, which remains the only thing that actually gates a section being committed. Set `review_provider`/`review_model` in the plan to pick which CLI performs the review (defaults to `claude`).
+
 This does not install a background daemon. macOS cannot run the supervisor while the machine is asleep or powered off. For unattended operation, use `launchd` on an awake Mac or `systemd` on an always-on machine. See [the design and implementation stages](docs/DESIGN.md) and [the test report](docs/TEST-REPORT.md).
