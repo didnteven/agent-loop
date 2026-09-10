@@ -60,15 +60,29 @@ class AdapterTests(unittest.TestCase):
     def test_review_parses_declined_verdict(self):
         with patch("loop.review.run_process",
                    return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
-                                    '"result":"{\\"approved\\": false, \\"concerns\\": [\\"fabricated\\"]}"}', "")):
+                                    '"result":"Task 2 duplicates existing code.\\nREVIEW: DECLINED"}', "")):
             verdict = review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
         self.assertFalse(verdict["approved"])
-        self.assertEqual(verdict["concerns"], ["fabricated"])
+        self.assertIn("duplicates", verdict["reasoning"])
+
+    def test_review_parses_approved_verdict(self):
+        with patch("loop.review.run_process",
+                   return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
+                                    '"result":"REVIEW: APPROVED"}', "")):
+            verdict = review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
+        self.assertTrue(verdict["approved"])
 
     def test_review_rejects_response_without_verdict(self):
         with patch("loop.review.run_process",
                    return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
-                                    '"result":"not json"}', "")):
+                                    '"result":"looks fine to me"}', "")):
+            with self.assertRaises(RuntimeError):
+                review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
+
+    def test_review_rejects_multiple_verdicts(self):
+        with patch("loop.review.run_process",
+                   return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
+                                    '"result":"REVIEW: APPROVED\\nwait, REVIEW: DECLINED"}', "")):
             with self.assertRaises(RuntimeError):
                 review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
 

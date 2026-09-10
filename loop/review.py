@@ -9,11 +9,26 @@ Two advisory checkpoints, both off by default:
 Neither is a trusted `check` — a review call is just another headless model
 invocation and can be wrong. It only gates the *optional* --review path;
 the underlying `run`/`publish` commands work identically without it.
+
+The verdict is a single sentinel line rather than JSON: the only thing the
+engine acts on programmatically is one boolean, so there is nothing for a
+structured format to buy here, and a bare marker is far less likely to be
+broken by a stray sentence, code fence, or tool-use attempt in the reply.
 """
 import json
+import re
 
 from .adapters import command, parse, run_process
 from .engine import git
+
+SENTINEL = re.compile(r"REVIEW:\s*(APPROVED|DECLINED)")
+
+VERDICT_INSTRUCTIONS = (
+    "Do not use any tool, do not ask a question, do not write files. "
+    "End your reply with exactly one line, alone, in this exact form: "
+    "\"REVIEW: APPROVED\" or \"REVIEW: DECLINED\". "
+    "Before that line, briefly state your reasoning as plain text (empty if approved).\n\n"
+)
 
 
 def _ask(provider, model, prompt, cwd, timeout):
@@ -22,25 +37,20 @@ def _ask(provider, model, prompt, cwd, timeout):
     if result.status != "ok":
         raise RuntimeError("Review call failed: " + (result.error or result.response or err)[-2000:])
     text = result.response.strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise RuntimeError("Review did not return a JSON object: " + text[:500])
-    verdict = json.loads(text[start:end + 1])
-    if "approved" not in verdict:
-        raise RuntimeError("Review response missing 'approved'")
-    verdict["approved"] = bool(verdict["approved"])
-    verdict["concerns"] = list(verdict.get("concerns") or [])
-    return verdict
+    matches = SENTINEL.findall(text)
+    if len(matches) != 1:
+        raise RuntimeError("Review did not end with exactly one REVIEW: verdict: " + text[:500])
+    verdict = matches[0] == "APPROVED"
+    reasoning = SENTINEL.sub("", text).strip()
+    return {"approved": verdict, "reasoning": reasoning}
 
 
 PLAN_REVIEW_PROMPT = (
     "You are sanity-checking a coding task plan before any worker touches the repository. "
     "For each task, judge whether its stated goal is a real, needed change (not fabricated, "
     "not already implemented, not duplicating existing functionality) and whether its `check` "
-    "command could plausibly verify the `prompt`'s claim. Do not implement anything; only judge. "
-    "Do not use any tool, do not ask a question, do not write files. Your entire reply must be "
-    "exactly one JSON object and nothing else: {\"approved\": bool, \"concerns\": [str, ...]}. "
-    "concerns must be empty if approved is true. The first character of your reply must be '{'.\n\nPLAN:\n"
+    "command could plausibly verify the `prompt`'s claim. Do not implement anything; only judge.\n\n"
+    + VERDICT_INSTRUCTIONS + "PLAN:\n"
 )
 
 
@@ -54,10 +64,8 @@ PR_REVIEW_PROMPT = (
     "narrow assertions passed, not that the change is a truthful, necessary response to its "
     "`prompt`, or that nothing unrelated slipped in. Compare each task's prompt against the diff "
     "hunks touching its declared files. Flag anything fabricated, unnecessary, unrelated to the "
-    "prompt, or where the diff does not actually do what the prompt asked. "
-    "Do not use any tool, do not ask a question, do not write files. Your entire reply must be "
-    "exactly one JSON object and nothing else: {\"approved\": bool, \"concerns\": [str, ...]}. "
-    "concerns must be empty if approved is true. The first character of your reply must be '{'.\n\n"
+    "prompt, or where the diff does not actually do what the prompt asked.\n\n"
+    + VERDICT_INSTRUCTIONS
 )
 
 

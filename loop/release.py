@@ -69,7 +69,7 @@ def publish(engine, run_id, repository, base="main", merge=False, review=False):
         verdict = review_pr(plan.get("review_provider", "claude"), plan.get("review_model"),
                              plan, workspace, fetched_base, plan.get("worker_timeout_seconds", 180))
         if not verdict["approved"]:
-            raise ValueError("PR review declined publication: " + "; ".join(verdict["concerns"]))
+            raise ValueError("PR review declined publication: " + verdict["reasoning"])
     git(workspace, "push", "origin", "HEAD:refs/heads/" + run["branch"])
     engine.prepare_pr(plan, run)
     if not prs:

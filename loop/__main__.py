@@ -66,7 +66,7 @@ def main():
                     verdict = review_plan(plan.get("review_provider", "claude"), plan.get("review_model"),
                                           plan, engine.repo, plan.get("worker_timeout_seconds", 180))
                     if not verdict["approved"]:
-                        print(json.dumps({"state": "review_declined", "concerns": verdict["concerns"]}))
+                        print(json.dumps({"state": "review_declined", "reasoning": verdict["reasoning"]}))
                         return 2
                 while True:
                     state, deadline = engine.tick(plan)
