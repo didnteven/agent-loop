@@ -7,6 +7,20 @@ description: Author and validate JSON milestone plans for the agent-loop supervi
 
 Plans are JSON files consumed by `Engine.tick` (`loop/engine.py`) and validated by `validate_plan`. Write the plan **in the target repo** the code will be generated into — task `files` paths are relative to that repo's worktree.
 
+## Authoring a plan for a different repo than the one you're in
+
+The `loop` module itself doesn't need to be inside the target repo — invocation always takes `--repo <path>`. It's common to be working from the agent-loop checkout (or any other directory) while writing a plan meant for a separate target repo. When that's the case:
+
+1. Ask for (or confirm) the target repo's absolute path if it isn't already clear from context.
+2. Read that repo's actual structure before writing `files`/`check` paths — don't guess filenames. List its directory tree and open any files the new task should extend or match conventions with.
+3. Verify the target repo is a git repo, clean, and has a commit (`git -C <target-repo> status --porcelain` should be empty).
+4. Write the plan JSON **into the target repo** (e.g. `<target-repo>/agent-loop-plans/<id>.json` or its root) — not into agent-loop's own directory — so it travels with the code it describes.
+5. Give the run command with an explicit `--repo`:
+   ```sh
+   python3 -m loop --repo <target-repo> run <target-repo>/<plan>.json
+   python3 -m loop --repo <target-repo> status
+   ```
+
 ## Required top-level fields
 
 ```json
