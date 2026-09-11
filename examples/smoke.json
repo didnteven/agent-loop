@@ -5,6 +5,8 @@
   "worker_timeout_seconds": 180,
   "unknown_quota_retry_seconds": 1800,
   "read_codex_quotas": true,
+  "failure_review": true,
+  "failure_review_provider": "claude",
   "provider_token_budgets": {"codex": 100000, "claude": 100000, "antigravity": 100000},
   "tasks": [
     {

@@ -22,6 +22,7 @@ from .adapters import command, parse, run_process
 from .engine import git
 
 SENTINEL = re.compile(r"REVIEW:\s*(APPROVED|DECLINED)")
+FAILURE_SENTINEL = re.compile(r"FAILURE:\s*(RETRY|BLOCK)")
 
 VERDICT_INSTRUCTIONS = (
     "Do not use any tool, do not ask a question, do not write files. "
@@ -75,3 +76,28 @@ def review_pr(provider, model, plan, workspace, base_sha, timeout=180):
     prompt = (PR_REVIEW_PROMPT + "TASKS:\n" + json.dumps(tasks, indent=2)
               + "\n\nDIFF:\n" + diff[:20000])
     return _ask(provider, model, prompt, workspace, timeout)
+
+
+FAILURE_REVIEW_INSTRUCTIONS = (
+    "You are diagnosing a failed coding task. Do not implement, edit files, use tools, ask "
+    "questions, delegate, or propose a changed plan. Decide only whether retrying the same "
+    "immutable task is reasonable. End your reply with exactly one line, alone, in this exact "
+    "form: \"FAILURE: RETRY\" or \"FAILURE: BLOCK\". Before that line, briefly state why.\n\n"
+)
+
+
+def review_failure(provider, model, task, failure, workspace, timeout=180):
+    """Return an advisory retry/block recommendation after a worker or check failure."""
+    diff = git(workspace, "diff", "HEAD", "--", *task["files"])
+    prompt = (FAILURE_REVIEW_INSTRUCTIONS + "TASK:\n" + json.dumps(
+        {key: task.get(key) for key in ("id", "files", "prompt", "check")}, indent=2)
+        + "\n\nFAILURE:\n" + failure[-4000:] + "\n\nUNCOMMITTED DIFF:\n" + diff[:20000])
+    code, out, err = run_process(command(provider, prompt, model), workspace, timeout)
+    result = parse(provider, code, out, err)
+    if result.status != "ok":
+        raise RuntimeError("Failure review call failed: " + (result.error or result.response or err)[-2000:])
+    text = result.response.strip()
+    matches = FAILURE_SENTINEL.findall(text)
+    if len(matches) != 1:
+        raise RuntimeError("Failure review did not return exactly one FAILURE verdict: " + text[:500])
+    return {"retry": matches[0] == "RETRY", "reasoning": FAILURE_SENTINEL.sub("", text).strip()}

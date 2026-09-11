@@ -41,7 +41,7 @@ def run_process(argv, cwd, timeout=180, stdin=None):
 def command(provider, prompt, model=None):
     prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
                "teammate, agent, or secondary model. Complete this task in the "
-               "current session and return only the requested JSON.")
+               "current session and return only the requested output format.")
     if provider == "codex":
         argv = ["codex", "exec", "--ignore-user-config", "--ephemeral", "--json",
                 "-s", "read-only", "-c", 'approval_policy="never"',

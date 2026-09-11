@@ -69,6 +69,11 @@ def validate_plan(plan):
         if provider not in ("codex", "claude", "antigravity"):
             raise ValueError("Unsupported provider in provider_token_budgets")
         check_budget(budget)
+    if not isinstance(plan.get("failure_review", False), bool):
+        raise ValueError("failure_review must be a boolean")
+    failure_provider = plan.get("failure_review_provider")
+    if failure_provider is not None and failure_provider not in ("codex", "claude", "antigravity"):
+        raise ValueError("Unsupported failure_review_provider")
 
 
 class Engine:
@@ -204,6 +209,22 @@ class Engine:
                         (until, reason, provider))
         self.db.commit()
 
+    def review_failure(self, plan, task, workspace, failure):
+        """Ask one advisory checker only when a plan opts into failure review."""
+        if not plan.get("failure_review", False):
+            return None
+        from .review import review_failure
+        provider = plan.get("failure_review_provider", task["provider"])
+        try:
+            verdict = review_failure(provider, plan.get("failure_review_model"), task, failure,
+                                     workspace, plan.get("failure_review_timeout_seconds", 180))
+            self.event(plan["id"], task["id"], "failure_review",
+                       "retry" if verdict["retry"] else "block")
+            return verdict
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.event(plan["id"], task["id"], "failure_review_unavailable", str(exc))
+            return None
+
     def tick(self, plan, worker=None, now=None):
         now = time.time() if now is None else now
         run = self.initialize(plan)
@@ -306,6 +327,11 @@ class Engine:
             if result.status != "ok":
                 state = "waiting" if result.status == "transient" else "blocked"
                 deadline = now + min(900, 30 * 2**row["attempts"]) if state == "waiting" else 0
+                if state == "blocked" and result.status == "error":
+                    verdict = self.review_failure(plan, task, workspace, result.error)
+                    if verdict and verdict["retry"]:
+                        state = "pending"
+                        result.error = "Failure review: " + verdict["reasoning"] + "\n" + result.error
                 self.set_task(plan["id"], task["id"], status=state, retry_at=deadline, error=result.error)
                 self.event(plan["id"], task["id"], state, result.error)
                 return state, deadline
@@ -328,8 +354,17 @@ class Engine:
                 self.event(plan["id"], task["id"], "done", sha)
                 return "progress", 0
             except (ValueError, OSError, subprocess.CalledProcessError) as exc:
-                self.set_task(plan["id"], task["id"], status="pending", error=str(exc))
-                self.event(plan["id"], task["id"], "check_failed", str(exc))
+                failure = str(exc)
+                verdict = self.review_failure(plan, task, workspace, failure)
+                if verdict and not verdict["retry"]:
+                    error = "Failure review: " + verdict["reasoning"] + "\nTrusted check: " + failure
+                    self.set_task(plan["id"], task["id"], status="blocked", error=error)
+                    self.event(plan["id"], task["id"], "blocked", error)
+                    return "blocked", 0
+                if verdict:
+                    failure = "Failure review: " + verdict["reasoning"] + "\nTrusted check: " + failure
+                self.set_task(plan["id"], task["id"], status="pending", error=failure)
+                self.event(plan["id"], task["id"], "check_failed", failure)
                 return "progress", 0
         if git(workspace, "status", "--porcelain"):
             raise RuntimeError("Milestone worktree must be clean before preparing its PR")

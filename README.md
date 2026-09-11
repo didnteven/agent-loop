@@ -21,6 +21,8 @@ Generated code lives in `.agent-loop/worktrees/three-provider-smoke`, on branch 
 
 `--once` performs one scheduler tick and returns, which is useful for external schedulers. Without it, quota waits continue without model calls. `Ctrl-C` or `SIGTERM` stops the runner and retains progress. A blocked authentication or configuration error waits for repair; stop the runner, fix the issue, use `python3 -m loop retry RUN_ID TASK_ID`, and resume.
 
+Plans can opt into `failure_review`. After a trusted check fails or a worker returns a terminal error, Python asks one configured checker provider whether the same immutable task should retry or block. This is advisory and runs only on failure; it cannot edit code, change the plan, or replace the trusted check.
+
 An observed reset can be recorded explicitly:
 
 ```sh

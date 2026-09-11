@@ -8,7 +8,7 @@ from unittest.mock import patch
 from loop.adapters import Result, command, parse, quota_deadline, run_process, token_total
 from loop.engine import Engine, git, safe_path, validate_plan
 from loop.release import checks_pass, publish, validate_remote
-from loop.review import review_plan
+from loop.review import review_failure, review_plan
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "concurrent_worker.py"
@@ -89,6 +89,17 @@ class AdapterTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 review_plan("claude", None, {"id": "x", "tasks": []}, "/private/tmp")
 
+    def test_failure_review_parses_retry_verdict(self):
+        task = {"id": "one", "files": ["answer.py"], "prompt": "write answer",
+                "check": ["python3", "-c", "pass"]}
+        with patch("loop.review.run_process",
+                   return_value=(0, '{"type":"result","subtype":"success","is_error":false,'
+                                    '"result":"The assertion is fixable.\\nFAILURE: RETRY"}', "")), \
+                patch("loop.review.git", return_value="diff"):
+            verdict = review_failure("claude", None, task, "assertion failed", "/private/tmp")
+        self.assertTrue(verdict["retry"])
+        self.assertIn("fixable", verdict["reasoning"])
+
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
@@ -152,6 +163,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.tick(self.plan, bad)[0], "blocked")
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
+
+    def test_failure_review_can_block_a_failed_check(self):
+        self.plan["failure_review"] = True
+        def bad(*_):
+            return Result("ok", '{"files":[{"path":"answer.py","content":"def add(a,b): return 0"}]}')
+        with patch.object(self.engine, "review_failure",
+                          return_value={"retry": False, "reasoning": "The task is underspecified."}):
+            self.assertEqual(self.engine.tick(self.plan, bad)[0], "blocked")
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual(row["status"], "blocked")
+        self.assertIn("underspecified", row["error"])
 
     def test_one_supervisor_per_milestone_but_not_per_repository(self):
         other = Engine(self.repo)

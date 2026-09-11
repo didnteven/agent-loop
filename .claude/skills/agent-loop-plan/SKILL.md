@@ -42,6 +42,9 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 | `check_timeout_seconds` | 30 | timeout for running each task's `check` |
 | `unknown_quota_retry_seconds` | 1800 | retry delay when a rate-limit has no machine-readable reset |
 | `read_codex_quotas` | true | preflight Codex's app-server quota API before spending a turn |
+| `failure_review` | false | on a failed trusted check or terminal worker error, ask one advisory checker whether to retry or block |
+| `failure_review_provider` | task's provider | provider for the failure checker; it must be `codex`, `claude`, or `antigravity` |
+| `failure_review_model` | none | optional model id for the failure checker |
 | `provider_token_budgets` | none | e.g. `{"codex": 100000}` — local admission cap per provider, counted across this plan's completed responses |
 | `review_provider` | `claude` | which CLI performs optional self-review (see below), only used if `--review` is passed |
 | `review_model` | none | model id for the review call, only used if `--review` is passed |
@@ -72,6 +75,10 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 Optional per-task fields:
 - `context_files`: list of paths (relative to the workspace) whose current contents (first 30000 chars each) get appended to the prompt as read-only context — use for files earlier tasks produced that a later task should build on.
 - `quota_bucket`: which Codex rate-limit bucket to preflight-check (default `"codex"`), only relevant when `provider` is `codex`.
+
+## Failure review
+
+Set `failure_review` when a plan should use one extra model call only after a trusted check fails or a worker returns a terminal error. The checker receives the task, failure output, and uncommitted diff, then returns `RETRY` or `BLOCK`. It cannot edit files, change the immutable plan, delegate work, or replace the trusted check. Use `failure_review_provider` to choose a provider with available quota.
 
 ## Checking provider usage before assigning `provider` per task
 
