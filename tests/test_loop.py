@@ -41,7 +41,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_arguments_are_not_shell_code(self):
         prompt = 'literal $(whoami) `date` "quotes"'
-        self.assertIn(prompt, command("claude", prompt))
+        self.assertTrue(any(prompt in argument for argument in command("claude", prompt)))
 
     def test_timeout_is_bounded(self):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], "/private/tmp", 0.05)

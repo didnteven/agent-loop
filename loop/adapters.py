@@ -39,13 +39,17 @@ def run_process(argv, cwd, timeout=180, stdin=None):
 
 
 def command(provider, prompt, model=None):
+    prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
+               "teammate, agent, or secondary model. Complete this task in the "
+               "current session and return only the requested JSON.")
     if provider == "codex":
         argv = ["codex", "exec", "--ignore-user-config", "--ephemeral", "--json",
                 "-s", "read-only", "-c", 'approval_policy="never"',
                 "-c", 'model_reasoning_effort="low"', prompt]
     elif provider == "claude":
         argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "",
-                "--safe-mode", "--no-session-persistence", "--effort", "low"]
+                "--disallowed-tools", "Agent", "--safe-mode", "--no-session-persistence",
+                "--effort", "low"]
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
                 "--sandbox", "--effort", "low", "--print-timeout", "150s"]
