@@ -43,7 +43,8 @@ def run_process(argv, cwd, timeout=180, stdin=None):
         return 124, out, err + "\nworker timeout"
 
 
-def command(provider, prompt, model=None, effort=None, worker=True, sandbox=True):
+def command(provider, prompt, model=None, effort=None, worker=True, sandbox=False,
+            workspace=None):
     effort = effort or (model.rsplit("-", 1)[-1]
                         if provider == "antigravity" and model
                         and model.rsplit("-", 1)[-1] in ("low", "medium", "high")
@@ -74,11 +75,28 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=True
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
                 "--disable-slash-commands", "--effort", effort, "--print-timeout", "150s"]
+        if workspace:
+            # Without this, agy edits files inside its own project scratch
+            # directory and ignores the process working directory entirely, so
+            # the managed worktree is never touched and every task fails on a
+            # missing file. Binding the workspace is what makes it edit in place.
+            argv += ["--add-dir", str(workspace)]
         if sandbox:
-            # Terminal restrictions. They also deny RunCommand, which a worker
-            # may need to write files or run a focused diagnostic; the caller
-            # chooses, and a denial is reported rather than silently succeeding.
-            argv.insert(-0 or len(argv), "--sandbox")
+            # Terminal restrictions. Measured behaviour: with --sandbox the CLI
+            # denies every run_command in headless mode, including the `pwd` the
+            # model issues to orient itself, and the worker then produces
+            # nothing. It is offered because the caller may want it, but it
+            # cannot be combined with auto-approval (the CLI rejects both flags
+            # together) and a worker under it will usually fail.
+            argv.append("--sandbox")
+        elif worker:
+            # Parity with the other two adapters, which already run unattended:
+            # codex uses approval_policy="never" and claude --permission-prompts
+            # none. Headless agy cannot answer a permission prompt, so without
+            # this any command it attempts is auto-denied and the task fails.
+            # Containment is the managed worktree plus the supervisor's
+            # allowlist, history and truncation checks, not this flag.
+            argv.append("--dangerously-skip-permissions")
     else:
         raise ValueError("Unknown provider: " + provider)
     if model and provider == "antigravity":

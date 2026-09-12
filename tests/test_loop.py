@@ -161,7 +161,14 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("", claude)
         antigravity = command("antigravity", "work")
         self.assertIn("accept-edits", antigravity)
-        self.assertIn("--sandbox", antigravity)
+        # A headless agy worker cannot answer a permission prompt, so without
+        # auto-approval every command it attempts is denied and it produces
+        # nothing. --sandbox forces exactly that and the two flags cannot be
+        # combined, so a worker gets auto-approval and restriction comes from
+        # the managed worktree and the supervisor's checks instead.
+        self.assertIn("--dangerously-skip-permissions", antigravity)
+        self.assertNotIn("--sandbox", antigravity)
+        self.assertIn("--sandbox", command("antigravity", "work", sandbox=True))
 
     def test_antigravity_model_tier_selects_matching_effort(self):
         argv = command("antigravity", "work", "gemini-3.1-pro-high")

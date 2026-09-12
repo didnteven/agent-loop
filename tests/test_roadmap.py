@@ -1246,9 +1246,26 @@ class ProviderDenialTests(unittest.TestCase):
         # The invocation happened and was billed; only its outcome was a fault.
         self.assertEqual(parse('antigravity', 0, self.denied(), '').usage['input_tokens'], 15284)
 
-    def test_the_sandbox_posture_is_explicit_in_the_command(self):
-        self.assertIn('--sandbox', command('antigravity', 'p'))
-        self.assertNotIn('--sandbox', command('antigravity', 'p', sandbox=False))
+    def test_the_antigravity_worker_is_bound_to_its_workspace(self):
+        # Without --add-dir, agy edits files in its own project scratch
+        # directory and never touches the managed worktree, so every task fails
+        # on a missing file while the provider reports SUCCESS.
+        argv = command('antigravity', 'p', workspace='/tmp/ws')
+        self.assertEqual(argv[argv.index('--add-dir') + 1], '/tmp/ws')
+        self.assertNotIn('--add-dir', command('antigravity', 'p'))
+        self.assertNotIn('--add-dir', command('codex', 'p', workspace='/tmp/ws'))
+
+    def test_a_headless_antigravity_worker_can_act(self):
+        # Headless agy cannot answer a permission prompt; without auto-approval
+        # any command it attempts is denied and it produces nothing.
+        self.assertIn('--dangerously-skip-permissions', command('antigravity', 'p'))
+        # The two flags are mutually exclusive in the CLI, so never both.
+        restricted = command('antigravity', 'p', sandbox=True)
+        self.assertIn('--sandbox', restricted)
+        self.assertNotIn('--dangerously-skip-permissions', restricted)
+        # Non-worker calls (planning, review) do not need to act.
+        self.assertNotIn('--dangerously-skip-permissions',
+                         command('antigravity', 'p', worker=False))
 
 
 class HeadroomRoutingTests(unittest.TestCase):

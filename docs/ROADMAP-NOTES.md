@@ -142,3 +142,29 @@ Driven by a live run that exhausted one subscription while two sat idle.
 an automatic planner call on every twice-failed task, which spends quota without being asked.
 On a constrained subscription that is the wrong default, even though the gym_trainer run showed
 the successor path produces a materially better change when it is enabled.
+
+## Antigravity was never functional (fixed)
+
+Live failover testing revealed that the antigravity worker had never once produced a file, in
+any run. Two independent causes, neither visible to a simulated provider:
+
+1. **The workspace was never bound.** `agy -p` edits files inside its own project scratch
+   directory (`~/.gemini/antigravity-cli/scratch`) and ignores the process working directory,
+   even though its own `init` event echoes the correct cwd. Every task therefore failed on a
+   missing file while the provider reported `SUCCESS`. Passing `--add-dir <workspace>` makes it
+   edit in place. Confirmed against unmodified user configuration.
+2. **A headless worker could not act.** `--sandbox` denies every `run_command`, including the
+   `pwd` the model issues to orient itself, and headless mode cannot prompt, so the worker gave
+   up having written nothing. The CLI rejects `--sandbox` together with
+   `--dangerously-skip-permissions`, so they are mutually exclusive.
+
+A worker now gets `--add-dir` plus auto-approval, which is parity with the other two adapters:
+codex already runs `approval_policy="never"` and claude `--permission-prompts none`.
+Containment is the managed worktree and the supervisor's allowlist, history and truncation
+checks, not a provider flag. `provider_sandbox: true` still selects the restricted posture for
+callers who want it, with the documented caveat that a worker under it usually fails.
+
+Narrower alternatives were tried first and rejected on evidence: a `permissions.allow` rule
+matching the observed command, and adding the workspace to `trustedWorkspaces`. The first
+cannot be enumerated ahead of time — the next model may run any command — and the second did
+not change the scratch-directory behaviour at all. The user's agy settings were restored.

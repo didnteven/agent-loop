@@ -842,7 +842,7 @@ class Engine:
             "unknown_quota_retry_seconds": plan.get("unknown_quota_retry_seconds", 1800),
             "provider_runner_timeout_seconds": plan.get("provider_runner_timeout_seconds", 86400),
             "lease_seconds": plan.get("worker_lease_seconds", 86400),
-            "sandbox": plan.get("provider_sandbox", True),
+            "sandbox": plan.get("provider_sandbox", False),
         }
         path = self.attempt_path(attempt_id)
         # Launch intent is durable before the spawn, so a crash in between
