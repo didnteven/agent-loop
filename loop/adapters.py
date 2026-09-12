@@ -43,7 +43,7 @@ def run_process(argv, cwd, timeout=180, stdin=None):
         return 124, out, err + "\nworker timeout"
 
 
-def command(provider, prompt, model=None, effort=None, worker=True):
+def command(provider, prompt, model=None, effort=None, worker=True, sandbox=True):
     effort = effort or (model.rsplit("-", 1)[-1]
                         if provider == "antigravity" and model
                         and model.rsplit("-", 1)[-1] in ("low", "medium", "high")
@@ -73,8 +73,12 @@ def command(provider, prompt, model=None, effort=None, worker=True):
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
-                "--sandbox", "--disable-slash-commands", "--effort", effort,
-                "--print-timeout", "150s"]
+                "--disable-slash-commands", "--effort", effort, "--print-timeout", "150s"]
+        if sandbox:
+            # Terminal restrictions. They also deny RunCommand, which a worker
+            # may need to write files or run a focused diagnostic; the caller
+            # chooses, and a denial is reported rather than silently succeeding.
+            argv.insert(-0 or len(argv), "--sandbox")
     else:
         raise ValueError("Unknown provider: " + provider)
     if model and provider == "antigravity":
@@ -291,6 +295,17 @@ def parse(provider, code, out, err, now=None):
                 success = event.get("type") == "result" and not event.get("is_error", True)
             else:
                 success = event.get("status") == "SUCCESS"
+            denied = event.get("denied_actions")
+            if isinstance(denied, list) and denied:
+                # Antigravity reports SUCCESS even when its sandbox denied every
+                # action the worker attempted. A run that was not allowed to act
+                # is an environment fault, not a completed turn: reporting it as
+                # ok costs another attempt and a review call to rediscover.
+                names = sorted({str(item.get("display_name") or item.get("action"))
+                                for item in denied if isinstance(item, dict)})
+                errors.append("Provider denied worker actions: " + ", ".join(names)
+                              + ". Permission denied by the provider sandbox.")
+                success = False
             if event.get("is_error") or event.get("error"):
                 errors.append(str(event.get("error", response)))
     waits = [event for event in events if event.get("agent_loop_result") == "provider_wait"]

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from loop.adapters import Result
+from loop.adapters import Result, command, parse
 from loop.engine import Engine, git, validate_plan
 from loop.planner import validate_generated_plan
 from loop import health, improve, learning
@@ -396,6 +396,21 @@ class DetachedWorkerTests(unittest.TestCase):
         self.plan = dict(id='detached', worker_lease_seconds=60,
                          tasks=[dict(id='answer', provider='codex', files=['answer.py'],
                                      prompt='Set value to 42', check=['python3', 'verify.py'])])
+        # These tests spawn real detached children. Reap them before the
+        # temporary directory is removed, or a still-running worker races the
+        # cleanup and fails the teardown rather than the assertion.
+        self.spawned = []
+        original_spawn = Engine.spawn
+
+        def recording_spawn(engine, argv):
+            process = original_spawn(engine, argv)
+            self.spawned.append(process)
+            return process
+
+        spawn_patch = patch.object(Engine, 'spawn', recording_spawn)
+        spawn_patch.start()
+        self.addCleanup(spawn_patch.stop)
+        self.addCleanup(self.reap_workers)
         # A real shim on PATH: the detached child is a separate process, so a
         # patched function in this one would not reach it.
         binaries = Path(self.temp.name) / 'bin'
@@ -409,6 +424,14 @@ class DetachedWorkerTests(unittest.TestCase):
         environment = patch.dict(os.environ, {'PATH': str(binaries) + os.pathsep + os.environ['PATH']})
         environment.start()
         self.addCleanup(environment.stop)
+
+    def reap_workers(self):
+        for process in self.spawned:
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     def run_detached(self, plan=None):
         return self.engine.tick(plan or self.plan)
@@ -1187,3 +1210,42 @@ class ImprovementTests(unittest.TestCase):
         manifest = improve.load_manifest(Path(__file__).resolve().parent.parent)
         self.assertIsNotNone(manifest)
         self.assertIn('tests/fixtures/manifest.json', improve.FENCED_PATHS)
+
+
+class ProviderDenialTests(unittest.TestCase):
+    """Regression: a denied worker action is not a successful turn.
+
+    Found by a live three-provider run, not by a fixture: antigravity reported
+    status SUCCESS with an empty response while its sandbox had denied every
+    action, so the supervisor spent a second attempt and an advisory review
+    call rediscovering that no file had been written.
+    """
+
+    def denied(self, **extra):
+        payload = {'status': 'SUCCESS', 'response': '', 'num_turns': 1,
+                   'usage': {'input_tokens': 15284, 'output_tokens': 70},
+                   'denied_actions': [{'action': 'command', 'display_name': 'RunCommand'}]}
+        payload.update(extra)
+        return json.dumps(payload)
+
+    def test_denied_actions_are_not_reported_as_success(self):
+        result = parse('antigravity', 0, self.denied(), '')
+        self.assertEqual(result.status, 'error')
+        self.assertIn('RunCommand', result.error)
+        self.assertIn('denied', result.error.lower())
+
+    def test_a_denial_is_classified_as_a_permission_fault(self):
+        from loop.diagnosis import PERMISSION, classify
+        self.assertEqual(classify(parse('antigravity', 0, self.denied(), '').error), PERMISSION)
+
+    def test_an_empty_denial_list_still_succeeds(self):
+        result = parse('antigravity', 0, self.denied(denied_actions=[], response='done'), '')
+        self.assertEqual(result.status, 'ok')
+
+    def test_usage_is_retained_for_a_denied_run(self):
+        # The invocation happened and was billed; only its outcome was a fault.
+        self.assertEqual(parse('antigravity', 0, self.denied(), '').usage['input_tokens'], 15284)
+
+    def test_the_sandbox_posture_is_explicit_in_the_command(self):
+        self.assertIn('--sandbox', command('antigravity', 'p'))
+        self.assertNotIn('--sandbox', command('antigravity', 'p', sandbox=False))

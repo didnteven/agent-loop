@@ -7,31 +7,50 @@
   "read_codex_quotas": true,
   "failure_review": true,
   "failure_review_provider": "claude",
-  "provider_token_budgets": {"codex": 100000, "claude": 100000, "antigravity": 100000},
+  "provider_token_budgets": {
+    "codex": 100000,
+    "claude": 100000,
+    "antigravity": 100000
+  },
   "tasks": [
     {
       "id": "codex-clamp",
       "provider": "codex",
       "model": "gpt-5.6-luna",
-      "files": ["demo/codex_clamp.py"],
+      "files": [
+        "demo/codex_clamp.py"
+      ],
       "prompt": "Write Python function clamp(value, low, high): bound value to the closed interval [low, high], preserving values inside it. Raise ValueError when low > high. Support negative numbers and floats. No imports needed.",
-      "check": ["python3", "examples/verify_clamp.py", "demo/codex_clamp.py"]
+      "check": [
+        "python3",
+        "examples/verify_codex_clamp.py"
+      ]
     },
     {
       "id": "claude-clamp",
       "provider": "claude",
       "model": "claude-haiku-4-5-20251001",
-      "files": ["demo/claude_clamp.py"],
+      "files": [
+        "demo/claude_clamp.py"
+      ],
       "prompt": "Write Python function clamp(value, low, high): bound value to the closed interval [low, high], preserving values inside it. Raise ValueError when low > high. Support negative numbers and floats. No imports needed.",
-      "check": ["python3", "examples/verify_clamp.py", "demo/claude_clamp.py"]
+      "check": [
+        "python3",
+        "examples/verify_claude_clamp.py"
+      ]
     },
     {
       "id": "antigravity-clamp",
       "provider": "antigravity",
       "model": "gemini-3.8-flash-low",
-      "files": ["demo/antigravity_clamp.py"],
+      "files": [
+        "demo/antigravity_clamp.py"
+      ],
       "prompt": "Write Python function clamp(value, low, high): bound value to the closed interval [low, high], preserving values inside it. Raise ValueError when low > high. Support negative numbers and floats. No imports needed.",
-      "check": ["python3", "examples/verify_clamp.py", "demo/antigravity_clamp.py"]
+      "check": [
+        "python3",
+        "examples/verify_antigravity_clamp.py"
+      ]
     }
   ]
 }

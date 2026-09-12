@@ -109,7 +109,7 @@ def run_attempt(record_path):
         task = record["task"]
         try:
             agent = command(task["provider"], build_prompt(record), task.get("model"),
-                            task.get("effort"))
+                            task.get("effort"), sandbox=record.get("sandbox", True))
             argv = runner_command(task["provider"], agent, workspace,
                                   record.get("worker_timeout_seconds", 180),
                                   record.get("unknown_quota_retry_seconds", 1800),
