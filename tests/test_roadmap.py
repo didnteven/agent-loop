@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from loop.adapters import Result, command, parse
+from loop.adapters import Result, command, parse, usage_fraction
 from loop.engine import Engine, git, validate_plan
 from loop.planner import validate_generated_plan
 from loop import health, improve, learning
@@ -1249,3 +1249,152 @@ class ProviderDenialTests(unittest.TestCase):
     def test_the_sandbox_posture_is_explicit_in_the_command(self):
         self.assertIn('--sandbox', command('antigravity', 'p'))
         self.assertNotIn('--sandbox', command('antigravity', 'p', sandbox=False))
+
+
+class HeadroomRoutingTests(unittest.TestCase):
+    """Quota gates eligibility, but a nearly-exhausted provider is also a stall."""
+
+    def setUp(self):
+        self.directory = isolate_registry(self)
+        self.registry = Registry(self.directory / 'registry.sqlite')
+        self.addCleanup(self.registry.close)
+        self.db = self.registry.db
+        health.ensure_schema(self.db)
+        self.models = [{'provider': 'claude', 'model': 'haiku', 'effort': 'low'},
+                       {'provider': 'antigravity', 'model': 'flash', 'effort': 'low'}]
+
+    def measure(self, provider, model, tokens, count=6, outcome='ok'):
+        for _ in range(count):
+            health.record_sample(self.db, provider=provider, model=model, effort='low',
+                                 task_class='c', outcome=outcome, tokens=tokens)
+
+    def test_usage_fraction_reads_the_binding_window(self):
+        self.assertEqual(usage_fraction(
+            {'rate_limits': {'session': {'usedPercent': 18}, 'week': {'usedPercent': 51}}}), 0.51)
+        self.assertIsNone(usage_fraction({'rate_limits': {}}))
+
+    def test_an_exhausted_provider_loses_even_when_it_is_more_efficient(self):
+        self.measure('claude', 'haiku', 1000)          # cheaper per acceptance
+        self.measure('antigravity', 'flash', 9000)     # dearer, but has room
+        choice, reason = health.choose_route(
+            self.db, self.models, 'c', headroom={'claude': 0.02, 'antigravity': 0.97})
+        self.assertEqual(choice['provider'], 'antigravity')
+        self.assertIn('headroom', reason)
+
+    def test_efficiency_still_ranks_when_both_have_room(self):
+        self.measure('claude', 'haiku', 1000)
+        self.measure('antigravity', 'flash', 9000)
+        choice, _ = health.choose_route(
+            self.db, self.models, 'c', headroom={'claude': 0.8, 'antigravity': 0.9})
+        self.assertEqual(choice['provider'], 'claude')
+
+    def test_unknown_headroom_is_usable_but_not_evidence_of_capacity(self):
+        self.measure('claude', 'haiku', 1000)
+        self.measure('antigravity', 'flash', 9000)
+        # antigravity has measured room; claude's headroom is unknown. Unknown
+        # must not be excluded, and must not win on the strength of not knowing.
+        choice, _ = health.choose_route(
+            self.db, self.models, 'c', headroom={'antigravity': 0.9})
+        self.assertIn(choice['provider'], ('claude', 'antigravity'))
+        # With every provider low, the run still proceeds rather than stalling.
+        choice, _ = health.choose_route(
+            self.db, self.models, 'c', headroom={'claude': 0.01, 'antigravity': 0.01})
+        self.assertIsNotNone(choice)
+
+
+class FailoverTests(unittest.TestCase):
+    """A long wait is not free: finish the same task on another provider."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        isolate_registry(self)
+        self.repo = Path(self.temp.name).resolve() / 'target'
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-q', str(self.repo)], check=True)
+        git(self.repo, 'config', 'user.name', 'Test')
+        git(self.repo, 'config', 'user.email', 'test@example.invalid')
+        (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-qm', 'initial')
+        self.engine = Engine(self.repo)
+        self.addCleanup(self.engine.db.close)
+        # Headroom polling spawns provider CLIs; this suite is about scheduling.
+        headroom = patch.object(Engine, 'refresh_headroom', return_value=None)
+        headroom.start()
+        self.addCleanup(headroom.stop)
+        self.plan = dict(id='failover', failover_after_seconds=3600, tasks=[
+            dict(id='answer', provider='claude', model='haiku', effort='low',
+                 files=['answer.py'], prompt='Set value to 42',
+                 check=['python3', 'verify.py'])])
+        self.plan['policy'] = {'models': [
+            {'provider': 'claude', 'model': 'haiku', 'effort': 'low'},
+            {'provider': 'antigravity', 'model': 'flash', 'effort': 'low'}]}
+
+    def good(self, task, prompt, workspace):
+        self.used.append(task['provider'])
+        (workspace / task['files'][0]).write_text('value = 42\n')
+        return Result('ok', 'done', {'input_tokens': 1, 'output_tokens': 1})
+
+    def test_a_long_wait_switches_provider_and_continues_the_same_task(self):
+        self.used = []
+        now = time.time()
+        self.engine.initialize(self.plan)
+        # Bank one failed attempt so we can prove history is carried, not reset.
+        self.engine.set_task('failover', 'answer', attempts=2, error='previous diagnostic')
+        self.engine.hold('claude', now + 4 * 3600, 'session limit', now)
+        state, _ = self.engine.tick(self.plan, self.good, now=now)
+        self.assertEqual(state, 'progress')
+        self.assertEqual(self.used, ['antigravity'])
+        row = self.engine.db.execute("SELECT * FROM tasks WHERE run_id='failover'").fetchone()
+        self.assertEqual(row['status'], 'done')
+        self.assertEqual(row['selected_provider'], 'antigravity')
+        # Continued, not restarted: the attempt history survived the switch.
+        self.assertEqual(row['attempts'], 3)
+        decision = self.engine.db.execute(
+            "SELECT * FROM decisions WHERE chosen='antigravity'").fetchone()
+        self.assertIn('unavailable', decision['question'])
+        self.assertTrue(self.engine.db.execute(
+            "SELECT 1 FROM events WHERE kind='failover'").fetchone())
+
+    def test_a_short_wait_still_waits(self):
+        self.used = []
+        now = time.time()
+        self.engine.initialize(self.plan)
+        self.engine.hold('claude', now + 120, 'brief backoff', now)
+        state, deadline = self.engine.tick(self.plan, self.good, now=now)
+        self.assertEqual(state, 'waiting')
+        self.assertEqual(self.used, [])
+        self.assertAlmostEqual(deadline, now + 120, delta=1)
+
+    def test_failover_never_uses_a_provider_that_is_also_held(self):
+        self.used = []
+        now = time.time()
+        self.engine.initialize(self.plan)
+        self.engine.hold('claude', now + 4 * 3600, 'session limit', now)
+        self.engine.hold('antigravity', now + 5 * 3600, 'also exhausted', now)
+        state, deadline = self.engine.tick(self.plan, self.good, now=now)
+        self.assertEqual(state, 'waiting')
+        self.assertEqual(self.used, [])
+        self.assertTrue(self.engine.db.execute(
+            "SELECT 1 FROM events WHERE kind='failover_unavailable'").fetchone())
+
+    def test_with_no_configured_alternative_it_waits(self):
+        self.used = []
+        now = time.time()
+        plan = copy.deepcopy(self.plan)
+        plan['policy']['models'] = [{'provider': 'claude', 'model': 'haiku', 'effort': 'low'}]
+        self.engine.initialize(plan)
+        self.engine.hold('claude', now + 4 * 3600, 'session limit', now)
+        self.assertEqual(self.engine.tick(plan, self.good, now=now)[0], 'waiting')
+        self.assertEqual(self.used, [])
+
+    def test_the_threshold_is_configurable(self):
+        self.used = []
+        now = time.time()
+        plan = copy.deepcopy(self.plan)
+        plan['failover_after_seconds'] = 60
+        self.engine.initialize(plan)
+        self.engine.hold('claude', now + 120, 'short by default, long for this plan', now)
+        self.assertEqual(self.engine.tick(plan, self.good, now=now)[0], 'progress')
+        self.assertEqual(self.used, ['antigravity'])

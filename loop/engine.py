@@ -25,7 +25,7 @@ from . import health
 # Provider argv assembly and transcript parsing now belong to the worker
 # boundary; the supervisor only consumes validated results.
 from .adapters import (Result, asked_question, auth_probe, provider_limits, quota_deadline,
-                       run_process, token_total)
+                       run_process, token_total, usage_fraction)
 
 
 def git(repo, *args):
@@ -285,9 +285,12 @@ class Engine:
         if "reservation_id" not in invocation_columns:
             self.db.execute("ALTER TABLE invocations ADD COLUMN reservation_id TEXT")
         provider_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(providers)")}
-        for name in ("probe_at", "held_since"):
+        for name in ("probe_at", "held_since", "headroom_at"):
             if name not in provider_columns:
                 self.db.execute("ALTER TABLE providers ADD COLUMN " + name + " REAL DEFAULT 0")
+        if "headroom" not in provider_columns:
+            # NULL, not 1.0: unknown headroom must never read as "plenty left".
+            self.db.execute("ALTER TABLE providers ADD COLUMN headroom REAL")
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(tasks)")}
         if "tokens" not in columns:
             self.db.execute("ALTER TABLE tasks ADD COLUMN tokens INTEGER DEFAULT 0")
@@ -969,14 +972,82 @@ class Engine:
         except sqlite3.Error:
             return configured
 
+    def refresh_headroom(self, plan, providers, now=None):
+        """Cache each provider's remaining quota fraction, politely.
+
+        Reading quota spawns a CLI, so it is rate-limited per provider and never
+        blocks work: an unreadable provider keeps NULL headroom, which routing
+        treats as unknown rather than as capacity.
+        """
+        now = time.time() if now is None else now
+        interval = plan.get("headroom_refresh_seconds", 600)
+        timeout = plan.get("probe_timeout_seconds", 30)
+        for provider in sorted(set(providers)):
+            row = self.db.execute("SELECT headroom_at FROM providers WHERE name=?",
+                                  (provider,)).fetchone()
+            if row and row["headroom_at"] and now - row["headroom_at"] < interval:
+                continue
+            fraction = None
+            try:
+                used = usage_fraction(provider_limits(provider, self.repo, timeout))
+                fraction = None if used is None else max(0.0, 1.0 - used)
+            except (FileNotFoundError, OSError, RuntimeError, TimeoutError, ValueError):
+                fraction = None
+            self.db.execute("UPDATE providers SET headroom=?,headroom_at=? WHERE name=?",
+                            (fraction, now, provider))
+        self.db.commit()
+
+    def headroom(self, providers):
+        known = {}
+        for provider in set(providers):
+            row = self.db.execute("SELECT headroom FROM providers WHERE name=?",
+                                  (provider,)).fetchone()
+            if row and row["headroom"] is not None:
+                known[provider] = row["headroom"]
+        return known
+
+    def failover_model(self, run, plan, task, now):
+        """Find a configured alternative that can run this task right now.
+
+        Used when the current provider's wait is long enough that continuing on
+        another provider beats sitting idle. The task keeps its identity, its
+        history and its workspace: this changes who does the next attempt, it
+        does not restart the work.
+        """
+        policy = json.loads(run["policy"])
+        configured = policy.get("models", [])
+        current = (task["provider"], task.get("model"), task.get("effort", "low"))
+        alternatives = []
+        for choice in configured:
+            if (choice["provider"], choice["model"], choice.get("effort", "low")) == current:
+                continue
+            held = self.db.execute("SELECT retry_at FROM providers WHERE name=?",
+                                   (choice["provider"],)).fetchone()
+            if held and held["retry_at"] > now:
+                continue
+            alternatives.append(choice)
+        if not alternatives:
+            return None, "no configured alternative is available"
+        self.refresh_headroom(plan, [choice["provider"] for choice in alternatives], now)
+        try:
+            chosen, reason = health.choose_route(
+                self.registry.db, alternatives, health.task_class(task), now,
+                headroom=self.headroom([choice["provider"] for choice in alternatives]))
+        except sqlite3.Error:
+            chosen, reason = alternatives[0], "first configured alternative"
+        return chosen, reason
+
     def route_task(self, run, plan, task, row):
         """Select a configured model on measured evidence, recording the reason."""
         if task.get("model") or row["selected_model"] or not plan.get("auto_route", False):
             return None
         policy = json.loads(run["policy"])
+        models = policy.get("models", [])
         try:
-            choice, reason = health.choose_route(self.registry.db, policy.get("models", []),
-                                                 health.task_class(task))
+            self.refresh_headroom(plan, [m["provider"] for m in models])
+            choice, reason = health.choose_route(
+                self.registry.db, models, health.task_class(task),
+                headroom=self.headroom([m["provider"] for m in models]))
         except sqlite3.Error:
             return None
         if not choice:
@@ -1202,8 +1273,41 @@ class Engine:
                 provider = self.db.execute("SELECT * FROM providers WHERE name=?", (task["provider"],)).fetchone()
                 retry_at = max(row["retry_at"], provider["retry_at"])
                 if retry_at > now:
-                    deadlines.append(retry_at)
-                    continue
+                    # A long wait is not free: finishing on another configured
+                    # provider beats idling. The task keeps its id, attempts,
+                    # accumulated error context and workspace — only the next
+                    # attempt's provider changes, so this continues the work
+                    # rather than restarting it.
+                    threshold = plan.get("failover_after_seconds", 3600)
+                    if retry_at - now >= threshold:
+                        choice, reason = self.failover_model(run, plan, task, now)
+                        if choice:
+                            self.set_task(plan["id"], task["id"],
+                                          selected_provider=choice["provider"],
+                                          selected_model=choice["model"],
+                                          selected_effort=choice.get("effort", "low"),
+                                          retry_at=0)
+                            self.decide(plan["id"], task["id"],
+                                        "Provider %s is unavailable for %d minutes"
+                                        % (task["provider"], (retry_at - now) // 60),
+                                        [task["provider"], choice["provider"]],
+                                        choice["provider"],
+                                        "Continued the same task on an available provider: "
+                                        + reason, [str(retry_at)], "routed")
+                            self.event(plan["id"], task["id"], "failover", choice["provider"])
+                            task = dict(task, provider=choice["provider"],
+                                        model=choice["model"],
+                                        effort=choice.get("effort", "low"))
+                            row = self.db.execute(
+                                "SELECT * FROM tasks WHERE run_id=? AND id=?",
+                                (plan["id"], task["id"])).fetchone()
+                        else:
+                            self.event(plan["id"], task["id"], "failover_unavailable", reason)
+                            deadlines.append(retry_at)
+                            continue
+                    else:
+                        deadlines.append(retry_at)
+                        continue
                 budget = plan.get("provider_token_budgets", {}).get(task["provider"])
                 if budget is not None and self.run_tokens(plan, task["provider"]) >= budget:
                     self.park(plan["id"], task["id"], "Local admission token budget reached for provider " + task["provider"], "policy")

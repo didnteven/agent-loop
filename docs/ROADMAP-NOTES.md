@@ -122,3 +122,23 @@ is not a claim about the running system.
   and every test here uses simulated providers.
 - The improvement worker that would *author* a candidate is not wired to a provider; the
   proposal, fencing, evaluation, canary and rollback machinery around it is.
+
+## Provider headroom and long-wait failover (implemented)
+
+Driven by a live run that exhausted one subscription while two sat idle.
+
+- `usage_fraction()` reads the most-consumed quota window; unknown stays unknown.
+- The engine caches each provider's remaining fraction in `providers.headroom`, refreshed at
+  most every `headroom_refresh_seconds` (default 600) because reading quota spawns a CLI.
+- `choose_route` now considers headroom: routes with real room are ranked first, and a
+  nearly-exhausted provider is used only when nothing better is free. Efficiency still ranks
+  among providers that have room; unknown headroom is usable but never preferred.
+- When a hold exceeds `failover_after_seconds` (default 3600), the task switches to an
+  available configured provider and continues: same task id, same workspace, same attempt
+  history and accumulated diagnostics. Only the next attempt's provider changes. A recorded
+  decision names both providers and the reason.
+
+`auto_replan` deliberately stays **opt-in**. Defaulting it on was tried and reverted: it makes
+an automatic planner call on every twice-failed task, which spends quota without being asked.
+On a constrained subscription that is the wrong default, even though the gym_trainer run showed
+the successor path produces a materially better change when it is enabled.

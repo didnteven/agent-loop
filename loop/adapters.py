@@ -105,6 +105,30 @@ def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=180
             str(unknown_retry_seconds), "--quota-bucket", quota_bucket, "--", *argv]
 
 
+def usage_fraction(data):
+    """The most-consumed quota window, as a fraction in [0, 1].
+
+    Returns None when no window reports a usage percentage: unknown headroom is
+    unknown, and must not be read as "plenty left".
+    """
+    seen = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            used = value.get("usedPercent", value.get("used_percentage"))
+            if isinstance(used, (int, float)):
+                seen.append(max(0.0, min(1.0, used / 100.0)))
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data)
+    # The binding constraint is the window closest to exhaustion.
+    return max(seen) if seen else None
+
+
 def quota_deadline(data, now=None):
     """Both quota windows must be available. Never assume a fixed five hours."""
     now = time.time() if now is None else now

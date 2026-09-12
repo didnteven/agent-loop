@@ -23,6 +23,10 @@ DEFAULT_PROBE_SECONDS = 900
 MIN_PROBE_SECONDS = 60
 MAX_PROBE_SECONDS = 21600
 MAX_TUNING_DELTA = 0.25
+# Below this remaining fraction a provider is close enough to its limit that
+# routing more work to it buys a stall rather than a result.
+LOW_HEADROOM = 0.15
+COMFORTABLE_HEADROOM = 0.35
 AGE_HALF_LIFE_SECONDS = 14 * 86400
 
 
@@ -87,14 +91,32 @@ def route_statistics(db, provider, model, effort, task_class, now=None):
     }
 
 
-def choose_route(db, models, task_class, now=None, minimum_success=0.3):
-    """Pick a configured model, preferring measured efficiency over availability.
+def choose_route(db, models, task_class, now=None, minimum_success=0.3, headroom=None):
+    """Pick a configured model on measured efficiency, within available quota.
 
-    Returns ``(model, reason)``. Plentiful quota does not make a model
-    efficient, so quota only constrains eligibility; it never ranks.
+    Returns ``(model, reason)``. Plentiful quota still does not make a model
+    efficient — efficiency ranks, quota gates — but the converse matters too: a
+    provider near its limit is a stall waiting to happen, so routes with real
+    headroom are considered first and a nearly-exhausted provider is only used
+    when nothing better is free. Unknown headroom is treated as usable but not
+    preferred, because absence of telemetry is not evidence of capacity.
     """
     if not models:
         return None, "no configured models"
+    headroom = headroom or {}
+
+    def remaining(model):
+        value = headroom.get(model["provider"])
+        return None if value is None else max(0.0, min(1.0, value))
+
+    roomy = [m for m in models if (remaining(m) is None or remaining(m) >= COMFORTABLE_HEADROOM)]
+    if roomy and len(roomy) != len(models):
+        chosen, reason = choose_route(db, roomy, task_class, now, minimum_success)
+        return chosen, reason + "; excluded providers under %d%% headroom" % (
+            COMFORTABLE_HEADROOM * 100)
+    usable = [m for m in models if (remaining(m) is None or remaining(m) > 0.0)]
+    if usable and len(usable) != len(models):
+        models = usable
     scored, unmeasured = [], []
     for model in models:
         stats = route_statistics(db, model["provider"], model.get("model"),
