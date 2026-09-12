@@ -32,11 +32,13 @@ python3 -m loop hold claude --until 0 --reason 'Clear manual hold'
 
 The timestamp above is an example, not your account's reset time. The supervisor checks both quota windows and uses the latest exhausted window's reset. A quota error without a machine-readable reset causes a 30-minute retry delay; it does not pretend that this is the actual refresh time.
 
+Claude Code quota telemetry is collected by the project status line into `.agent-loop/claude-quota.json`. Claude supplies the five-hour and seven-day windows after the first response for Claude.ai subscribers; if those fields are unavailable, the supervisor continues safely and falls back to quota-error detection.
+
 ## Scope of this prototype
 
 - Durable SQLite state, one supervisor lock per milestone, isolated Git worktrees, checks, section commits, crash reconciliation after a commit, and bounded repair attempts. Milestones with different plan ids run concurrently against the same repository; a short repository-wide lock serializes only the git plumbing that touches shared state, such as adding a worktree or fetching a PR base.
 - Official headless adapters for Codex, Claude Code, and Antigravity. Workers return a JSON file bundle; the supervisor validates the file paths, applies the code, runs checks, and commits. This intentionally small first version does not give workers an unrestricted shell.
-- Automatic Codex quota preflight through its documented app-server API. Claude and Antigravity expose usage in other forms; the MVP handles their quota errors and manual reset holds. It does not claim to read their full account allowance automatically.
+- Automatic Codex quota preflight through its documented app-server API, plus Claude Code status-line quota snapshots. Antigravity exposes usage in another form; the MVP handles its quota errors and manual reset holds.
 - Per-provider, per-milestone, and per-section token accounting and admission budgets. `provider_token_budgets` counts only the current plan's spend, so a concurrent milestone cannot exhaust it; a task's optional `token_budget` caps one section. Counts cover this supervisor's completed responses, not everything used by your other sessions. A running task can exceed the remaining local token budget; this is not a hard provider billing cap. Claude's reported dollar figure is an estimate, not proof of a charge.
 - One milestone per plan. Completion creates a PR body and a `ready_for_pr` state. Publishing and merging are a separate explicit release command, described in [the design](docs/DESIGN.md).
 

@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 .claude/claude-quota-statusline.py",
+    "refreshInterval": 60
+  }
+}

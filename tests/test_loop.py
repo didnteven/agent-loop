@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from loop.adapters import Result, command, parse, quota_deadline, run_process, token_total
+from loop.adapters import (Result, claude_limits, command, parse, quota_deadline,
+                           run_process, token_total)
 from loop.engine import Engine, git, safe_path, validate_plan
 from loop.release import checks_pass, publish, validate_remote
 from loop.review import review_failure, review_plan
@@ -39,12 +40,21 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result.status, "rate_limited")
         self.assertEqual(result.retry_at, 0)
 
+    def test_claude_limits_reads_statusline_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / ".agent-loop"
+            snapshot.mkdir()
+            (snapshot / "claude-quota.json").write_text(json.dumps({
+                "rate_limits": {"five_hour": {"used_percentage": 100, "resets_at": 200}}
+            }))
+            self.assertEqual(claude_limits(directory)["rate_limits"]["five_hour"]["resets_at"], 200)
+
     def test_arguments_are_not_shell_code(self):
         prompt = 'literal $(whoami) `date` "quotes"'
         self.assertTrue(any(prompt in argument for argument in command("claude", prompt)))
 
     def test_timeout_is_bounded(self):
-        code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], "/private/tmp", 0.05)
+        code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
 
     def test_merge_requires_real_passing_checks(self):

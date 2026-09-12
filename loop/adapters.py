@@ -80,6 +80,16 @@ def quota_deadline(data, now=None):
     return max(deadlines, default=0)
 
 
+def claude_limits(cwd):
+    """Read the latest Claude Code status-line snapshot for a workspace."""
+    path = os.path.join(cwd, ".agent-loop", "claude-quota.json")
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict) or not isinstance(data.get("rate_limits"), dict):
+        raise ValueError("Claude quota snapshot has no rate_limits object")
+    return data
+
+
 def parse(provider, code, out, err, now=None):
     now = time.time() if now is None else now
     events = []

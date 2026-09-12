@@ -10,7 +10,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .adapters import command, codex_limits, parse, quota_deadline, run_process, token_total
+from .adapters import (claude_limits, command, codex_limits, parse, quota_deadline,
+                       run_process, token_total)
 
 
 def git(repo, *args):
@@ -284,6 +285,15 @@ class Engine:
                         self.hold("codex", deadline, "Provider quota exhausted")
                         return "waiting", deadline
                 except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+                    self.event(plan["id"], task["id"], "quota_unknown", str(exc))
+            if worker is None and task["provider"] == "claude" and plan.get("read_claude_quotas", True):
+                try:
+                    limits = claude_limits(workspace)
+                    deadline = quota_deadline(limits, now)
+                    if deadline:
+                        self.hold("claude", deadline, "Provider quota exhausted")
+                        return "waiting", deadline
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     self.event(plan["id"], task["id"], "quota_unknown", str(exc))
             prompt = ("Implement this small coding section. Do not use tools, run commands, or edit files. "
                       "Return ONLY a JSON object with a files array of {path, content}, containing complete file contents. "
