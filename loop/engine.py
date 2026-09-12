@@ -44,6 +44,79 @@ def check_budget(budget):
         raise ValueError("Token budgets must be non-negative integers")
 
 
+def changed_files(workspace):
+    changed = set(git(workspace, "diff", "HEAD", "--name-only").splitlines())
+    changed.update(git(workspace, "ls-files", "--others", "--exclude-standard").splitlines())
+    return {name for name in changed if name}
+
+
+def restore_task_files(workspace, names):
+    """Discard an unsuccessful worker attempt inside its supervisor-owned worktree."""
+    tracked = set(git(workspace, "ls-files", "--", *names).splitlines())
+    if tracked:
+        git(workspace, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked)
+    for name in set(names) - tracked:
+        target = safe_path(workspace, name)
+        if target.exists():
+            if not target.is_file():
+                raise ValueError("Worker created a non-file at " + name)
+            target.unlink()
+
+
+def restore_worker_attempt(workspace, head=None):
+    if head and git(workspace, "rev-parse", "HEAD") != head:
+        git(workspace, "reset", "--mixed", head)
+    names = changed_files(workspace)
+    if names:
+        restore_task_files(workspace, names)
+
+
+def file_snapshot(workspace, names):
+    snapshot = {}
+    for name in names:
+        path = safe_path(workspace, name)
+        snapshot[name] = path.read_bytes() if path.is_file() else None
+    return snapshot
+
+
+def validate_worker_changes(task, workspace, before, head):
+    if git(workspace, "rev-parse", "HEAD") != head:
+        raise ValueError("Worker changed the managed Git history")
+    changed = changed_files(workspace)
+    unexpected = changed - set(task["files"])
+    if unexpected:
+        raise ValueError("Worker changed files outside its allowlist: " + ", ".join(sorted(unexpected)))
+    if not changed:
+        raise ValueError("Worker completed without changing an allowed file")
+    max_shrink = task.get("max_file_shrink_fraction", 0.5)
+    if task.get("allow_large_deletions", False):
+        max_shrink = 1.0
+    for name in changed:
+        old = before.get(name)
+        path = safe_path(workspace, name)
+        if old is None or not path.is_file() or len(old) < 1000:
+            continue
+        shrink = 1 - (path.stat().st_size / len(old))
+        if shrink > max_shrink:
+            raise ValueError(
+                f"Suspicious truncation of {name}: {len(old)} bytes became "
+                f"{path.stat().st_size} bytes ({shrink:.0%} smaller)")
+    return changed
+
+
+def validate_managed_history(plan, run, workspace, done_shas):
+    """Allow only recorded task commits or crash-recovery commits with exact markers."""
+    task_ids = {task["id"] for task in plan["tasks"]}
+    commits = git(workspace, "rev-list", run["base"] + "..HEAD").splitlines()
+    for sha in commits:
+        if sha in done_shas:
+            continue
+        message = git(workspace, "show", "-s", "--format=%B", sha)
+        if not any("Agent-Loop-Task: " + plan["id"] + "/" + task_id in message
+                   for task_id in task_ids):
+            raise RuntimeError("Managed worktree contains an unrecognized commit: " + sha)
+
+
 def validate_plan(plan):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", plan["id"]):
         raise ValueError("Plan id must be a short lowercase slug")
@@ -60,6 +133,20 @@ def validate_plan(plan):
             safe_path(Path.cwd(), name)
         if not isinstance(task.get("check"), list) or not task["check"]:
             raise ValueError("Every task needs a trusted check argv")
+        if any(name in arg for name in task["files"]
+               for arg in task["check"] if isinstance(arg, str)):
+            raise ValueError("A worker cannot edit the trusted check it runs")
+        effort = task.get("effort", "low")
+        if effort not in ("low", "medium", "high"):
+            raise ValueError("Task effort must be low, medium, or high")
+        model_effort = str(task.get("model", "")).rsplit("-", 1)[-1]
+        if (task["provider"] == "antigravity" and task.get("model")
+                and model_effort in ("low", "medium", "high")
+                and "effort" in task and effort != model_effort):
+            raise ValueError("Antigravity model tier conflicts with task effort")
+        shrink = task.get("max_file_shrink_fraction", 0.5)
+        if isinstance(shrink, bool) or not isinstance(shrink, (int, float)) or not 0 <= shrink <= 1:
+            raise ValueError("max_file_shrink_fraction must be between 0 and 1")
         check_budget(task.get("token_budget"))
     if not ids:
         raise ValueError("Plan needs tasks")
@@ -75,6 +162,10 @@ def validate_plan(plan):
     failure_provider = plan.get("failure_review_provider")
     if failure_provider is not None and failure_provider not in ("codex", "claude", "antigravity"):
         raise ValueError("Unsupported failure_review_provider")
+    setup = plan.get("setup")
+    if setup is not None and (not isinstance(setup, list) or not setup
+                              or not all(isinstance(arg, str) and arg for arg in setup)):
+        raise ValueError("setup must be a non-empty argv list")
 
 
 class Engine:
@@ -210,6 +301,28 @@ class Engine:
                         (until, reason, provider))
         self.db.commit()
 
+    def ensure_setup(self, plan, run, workspace):
+        setup = plan.get("setup")
+        if not setup:
+            return
+        directory = self.home / "setup"
+        directory.mkdir(exist_ok=True)
+        marker = directory / (plan["id"] + "-" + run["digest"] + ".done")
+        if marker.exists():
+            return
+        self.event(plan["id"], "setup", "running", setup)
+        head = git(workspace, "rev-parse", "HEAD")
+        code, out, err = run_process(setup, workspace, plan.get("setup_timeout_seconds", 600))
+        if code:
+            restore_worker_attempt(workspace, head)
+            self.event(plan["id"], "setup", "blocked", (out + err)[-4000:])
+            raise RuntimeError("Workspace setup failed: " + ((out + err)[-4000:] or str(code)))
+        if changed_files(workspace):
+            restore_worker_attempt(workspace, head)
+            raise RuntimeError("Workspace setup changed tracked or unignored files")
+        marker.write_text(str(time.time()))
+        self.event(plan["id"], "setup", "done", "Workspace dependencies are ready")
+
     def review_failure(self, plan, task, workspace, failure):
         """Ask one advisory checker only when a plan opts into failure review."""
         if not plan.get("failure_review", False):
@@ -232,6 +345,10 @@ class Engine:
         workspace = Path(run["workspace"])
         if git(workspace, "branch", "--show-current") != run["branch"]:
             raise RuntimeError("Managed worktree branch changed")
+        self.ensure_setup(plan, run, workspace)
+        done_shas = {row["sha"] for row in self.db.execute(
+            "SELECT sha FROM tasks WHERE run_id=? AND sha IS NOT NULL", (plan["id"],))}
+        validate_managed_history(plan, run, workspace, done_shas)
         # Sequential section dependencies: a later task may depend on earlier files.
         for task in plan["tasks"]:
             row = self.db.execute("SELECT * FROM tasks WHERE run_id=? AND id=?",
@@ -241,8 +358,7 @@ class Engine:
                 continue
             if row["status"] == "blocked":
                 return "blocked", 0
-            changed = set(git(workspace, "diff", "HEAD", "--name-only").splitlines())
-            changed.update(git(workspace, "ls-files", "--others", "--exclude-standard").splitlines())
+            changed = changed_files(workspace)
             if changed - set(task["files"]):
                 raise RuntimeError("Unexpected changes in managed worktree; inspect before resuming")
             marker = "Agent-Loop-Task: " + plan["id"] + "/" + task["id"]
@@ -252,6 +368,15 @@ class Engine:
             if sha and not row["error"].startswith("Milestone regression:"):
                 self.set_task(plan["id"], task["id"], status="done", sha=sha)
                 continue
+            # A failed check or interrupted process must never become the next
+            # attempt's starting point. Managed worktrees are supervisor-owned.
+            if changed:
+                restore_task_files(workspace, task["files"])
+            if row["status"] == "running":
+                self.set_task(plan["id"], task["id"], status="pending",
+                              error="Recovered an interrupted worker attempt")
+                row = self.db.execute("SELECT * FROM tasks WHERE run_id=? AND id=?",
+                                      (plan["id"], task["id"])).fetchone()
             provider = self.db.execute("SELECT * FROM providers WHERE name=?", (task["provider"],)).fetchone()
             retry_at = max(row["retry_at"], provider["retry_at"])
             if retry_at > now:
@@ -295,9 +420,10 @@ class Engine:
                         return "waiting", deadline
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     self.event(plan["id"], task["id"], "quota_unknown", str(exc))
-            prompt = ("Implement this small coding section. Do not use tools, run commands, or edit files. "
-                      "Return ONLY a JSON object with a files array of {path, content}, containing complete file contents. "
-                      "Use exactly these paths: " + json.dumps(task["files"]) + ".\n" + task["prompt"])
+            prompt = ("Implement this coding section directly in the managed worktree. "
+                      "Use repository tools to read, search, edit, and run focused diagnostics. "
+                      "You may modify only these paths: " + json.dumps(task["files"]) + ". "
+                      "Do not commit or change branches.\n" + task["prompt"])
             for name in task.get("context_files", []):
                 path = safe_path(workspace, name)
                 prompt += "\nCONTEXT " + name + "\n" + path.read_text()[:30000]
@@ -305,11 +431,14 @@ class Engine:
                 prompt += "\nPrevious attempt failed this trusted check; fix the issue:\n" + row["error"][-4000:]
             self.set_task(plan["id"], task["id"], status="running", attempts=row["attempts"]+1, retry_at=0)
             self.event(plan["id"], task["id"], "running", task["provider"])
+            head = git(workspace, "rev-parse", "HEAD")
+            before = file_snapshot(workspace, task["files"])
             try:
                 if worker:
                     result = worker(task, prompt, workspace)
                 else:
-                    code, out, err = run_process(command(task["provider"], prompt, task.get("model")),
+                    code, out, err = run_process(command(task["provider"], prompt, task.get("model"),
+                                                         task.get("effort")),
                                                  workspace, plan.get("worker_timeout_seconds", 180))
                     logdir = self.home / "logs" / plan["id"]
                     logdir.mkdir(parents=True, exist_ok=True)
@@ -317,7 +446,13 @@ class Engine:
                     (logdir / (prefix+".jsonl")).write_text(out)
                     (logdir / (prefix+".stderr")).write_text(err)
                     result = parse(task["provider"], code, out, err, now)
+            except KeyboardInterrupt:
+                restore_worker_attempt(workspace, head)
+                self.set_task(plan["id"], task["id"], status="pending", attempts=row["attempts"],
+                              error="Worker interrupted; its uncommitted changes were discarded")
+                raise
             except OSError as exc:
+                restore_worker_attempt(workspace, head)
                 self.set_task(plan["id"], task["id"], status="blocked", error=str(exc))
                 return "blocked", 0
             spent = token_total(task["provider"], result.usage)
@@ -327,6 +462,7 @@ class Engine:
                             (spent, plan["id"], task["id"]))
             self.db.commit()
             if result.status == "rate_limited":
+                restore_worker_attempt(workspace, head)
                 # Unknown reset: probe slowly; this is a retry time, not a claimed reset.
                 delay = plan.get("unknown_quota_retry_seconds", 1800)
                 deadline = result.retry_at or now + delay
@@ -335,6 +471,7 @@ class Engine:
                 self.event(plan["id"], task["id"], "waiting", deadline)
                 return "waiting", deadline
             if result.status != "ok":
+                restore_worker_attempt(workspace, head)
                 state = "waiting" if result.status == "transient" else "blocked"
                 deadline = now + min(900, 30 * 2**row["attempts"]) if state == "waiting" else 0
                 if state == "blocked" and result.status == "error":
@@ -348,10 +485,22 @@ class Engine:
             if result.retry_at:
                 self.hold(task["provider"], result.retry_at, "Quota exhausted after completed section")
             try:
-                self.apply_result(task, result.response, workspace)
+                # Injected workers used by tests may still return the legacy JSON
+                # payload. Real CLI workers edit the managed worktree directly.
+                if git(workspace, "rev-parse", "HEAD") != head:
+                    raise ValueError("Worker changed the managed Git history")
+                if worker is not None and not changed_files(workspace) and result.response:
+                    self.apply_result(task, result.response, workspace)
+                validate_worker_changes(task, workspace, before, head)
                 code, out, err = run_process(task["check"], workspace, plan.get("check_timeout_seconds", 30))
                 if code:
                     raise ValueError((out+err)[-4000:] or "Check exited " + str(code))
+                if git(workspace, "rev-parse", "HEAD") != head:
+                    raise ValueError("Trusted check changed the managed Git history")
+                unexpected = changed_files(workspace) - set(task["files"])
+                if unexpected:
+                    raise ValueError("Trusted check changed unexpected files: "
+                                     + ", ".join(sorted(unexpected)))
                 git(workspace, "add", "--", *task["files"])
                 if git(workspace, "diff", "--cached", "--name-only") == "":
                     raise ValueError("No code change to commit")
@@ -366,6 +515,7 @@ class Engine:
             except (ValueError, OSError, subprocess.CalledProcessError) as exc:
                 failure = str(exc)
                 verdict = self.review_failure(plan, task, workspace, failure)
+                restore_worker_attempt(workspace, head)
                 if verdict and not verdict["retry"]:
                     error = "Failure review: " + verdict["reasoning"] + "\nTrusted check: " + failure
                     self.set_task(plan["id"], task["id"], status="blocked", error=error)

@@ -53,6 +53,23 @@ class AdapterTests(unittest.TestCase):
         prompt = 'literal $(whoami) `date` "quotes"'
         self.assertTrue(any(prompt in argument for argument in command("claude", prompt)))
 
+    def test_worker_commands_enable_tools_but_disable_delegation(self):
+        codex = command("codex", "work")
+        self.assertIn("workspace-write", codex)
+        self.assertIn("multi_agent", codex)
+        self.assertIn("multi_agent_v2", codex)
+        claude = command("claude", "work")
+        self.assertIn("default", claude)
+        self.assertIn("Agent", claude)
+        self.assertNotIn("", claude)
+        antigravity = command("antigravity", "work")
+        self.assertIn("accept-edits", antigravity)
+        self.assertIn("--sandbox", antigravity)
+
+    def test_antigravity_model_tier_selects_matching_effort(self):
+        argv = command("antigravity", "work", "gemini-3.1-pro-high")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
     def test_timeout_is_bounded(self):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
@@ -174,6 +191,90 @@ class EngineTests(unittest.TestCase):
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
 
+    def test_tool_worker_edits_managed_worktree_directly(self):
+        def tool_worker(_task, _prompt, workspace):
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "Implemented and checked the requested file")
+        self.assertEqual(self.engine.tick(self.plan, tool_worker)[0], "progress")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b): return a+b\n")
+
+    def test_failed_check_rolls_back_before_retry(self):
+        calls = 0
+        def worker(_task, _prompt, workspace):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.assertFalse((workspace / "answer.py").exists())
+            content = "def add(a,b): return 0\n" if calls == 1 else "def add(a,b): return a+b\n"
+            (workspace / "answer.py").write_text(content)
+            return Result("ok", "done")
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertFalse((workspace / "answer.py").exists())
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+
+    def test_suspicious_existing_file_truncation_is_rejected_and_rolled_back(self):
+        original = "line of important existing content\n" * 100
+        (self.repo / "large.txt").write_text(original)
+        git(self.repo, "add", "large.txt")
+        git(self.repo, "commit", "-qm", "large fixture")
+        self.plan["tasks"][0]["files"] = ["large.txt"]
+        self.plan["tasks"][0]["check"] = ["python3", "-c", "pass"]
+        def truncating(_task, _prompt, workspace):
+            (workspace / "large.txt").write_text("replacement\n")
+            return Result("ok", "done")
+        self.assertEqual(self.engine.tick(self.plan, truncating)[0], "progress")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertEqual((workspace / "large.txt").read_text(), original)
+        self.assertIn("Suspicious truncation", self.engine.status()["tasks"][0]["error"])
+
+    def test_interrupted_worker_is_pending_and_rolled_back(self):
+        def interrupted(_task, _prompt, workspace):
+            (workspace / "answer.py").write_text("partial")
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.engine.tick(self.plan, interrupted)
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertFalse((workspace / "answer.py").exists())
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+
+    def test_worker_commit_is_rejected_and_history_is_restored(self):
+        def committing(_task, _prompt, workspace):
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            git(workspace, "add", "answer.py")
+            git(workspace, "commit", "-qm", "worker must not commit")
+            return Result("ok", "done")
+        self.assertEqual(self.engine.tick(self.plan, committing)[0], "progress")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
+        self.assertFalse((workspace / "answer.py").exists())
+        self.assertIn("Git history", self.engine.status()["tasks"][0]["error"])
+
+    def test_setup_runs_before_worker_and_allows_ignored_dependencies(self):
+        with (self.repo / ".gitignore").open("a") as handle:
+            handle.write(".deps-ready\n")
+        git(self.repo, "add", ".gitignore")
+        git(self.repo, "commit", "-qm", "ignore setup fixture")
+        self.plan["setup"] = ["python3", "-c",
+                              "from pathlib import Path; Path('.deps-ready').write_text('ready')"]
+        def worker(_task, _prompt, workspace):
+            self.assertTrue((workspace / ".deps-ready").exists())
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "done")
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "ready_for_pr")
+
+    def test_failed_setup_rolls_back_changes(self):
+        self.plan["setup"] = ["python3", "-c",
+                              "from pathlib import Path; Path('setup-damage').write_text('x'); raise SystemExit(1)"]
+        with self.assertRaisesRegex(RuntimeError, "setup failed"):
+            self.engine.tick(self.plan, self.good_worker)
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertFalse((workspace / "setup-damage").exists())
+
     def test_failure_review_can_block_a_failed_check(self):
         self.plan["failure_review"] = True
         def bad(*_):
@@ -243,6 +344,18 @@ class EngineTests(unittest.TestCase):
             plan = dict(self.plan, provider_token_budgets=budget)
             with self.assertRaises(ValueError):
                 validate_plan(plan)
+
+    def test_worker_cannot_own_its_trusted_check(self):
+        self.plan["tasks"][0]["files"] = ["verify.py"]
+        self.plan["tasks"][0]["check"] = ["python3", "verify.py"]
+        with self.assertRaisesRegex(ValueError, "trusted check"):
+            validate_plan(self.plan)
+
+    def test_incompatible_antigravity_effort_is_rejected(self):
+        task = self.plan["tasks"][0]
+        task.update(provider="antigravity", model="gemini-3.1-pro-high", effort="low")
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            validate_plan(self.plan)
 
     def test_path_and_response_boundary(self):
         for name in ("../outside", ".git/config", "/tmp/outside", ".agent-loop/state.sqlite"):

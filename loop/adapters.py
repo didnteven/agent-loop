@@ -38,21 +38,30 @@ def run_process(argv, cwd, timeout=180, stdin=None):
         return 124, out, err + "\nworker timeout"
 
 
-def command(provider, prompt, model=None):
+def command(provider, prompt, model=None, effort=None):
+    effort = effort or (model.rsplit("-", 1)[-1]
+                        if provider == "antigravity" and model
+                        and model.rsplit("-", 1)[-1] in ("low", "medium", "high")
+                        else "low")
     prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
                "teammate, agent, or secondary model. Complete this task in the "
-               "current session and return only the requested output format.")
+               "current session. Use your repository tools to inspect and edit the "
+               "managed worktree directly. Do not commit, change branches, or edit "
+               "outside the allowed files. Finish with a concise summary.")
     if provider == "codex":
         argv = ["codex", "exec", "--ignore-user-config", "--ephemeral", "--json",
-                "-s", "read-only", "-c", 'approval_policy="never"',
-                "-c", 'model_reasoning_effort="low"', prompt]
+                "--disable", "multi_agent", "--disable", "multi_agent_v2",
+                "-s", "workspace-write", "-c", 'approval_policy="never"',
+                "-c", 'model_reasoning_effort="' + effort + '"', prompt]
     elif provider == "claude":
-        argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "",
+        argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "default",
                 "--disallowed-tools", "Agent", "--safe-mode", "--no-session-persistence",
-                "--effort", "low"]
+                "--restricted", "--permission-mode", "acceptEdits",
+                "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
-        argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
-                "--sandbox", "--effort", "low", "--print-timeout", "150s"]
+        argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
+                "--sandbox", "--disable-slash-commands", "--effort", effort,
+                "--print-timeout", "150s"]
     else:
         raise ValueError("Unknown provider: " + provider)
     if model:

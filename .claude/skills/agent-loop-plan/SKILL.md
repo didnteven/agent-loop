@@ -40,6 +40,8 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 | `max_attempts` | 3 | repair attempts per task before it's `blocked` |
 | `worker_timeout_seconds` | 180 | subprocess timeout per model call |
 | `check_timeout_seconds` | 30 | timeout for running each task's `check` |
+| `setup` | none | one-time argv command run in the fresh worktree before workers |
+| `setup_timeout_seconds` | 600 | timeout for the one-time setup command |
 | `unknown_quota_retry_seconds` | 1800 | retry delay when a rate-limit has no machine-readable reset |
 | `read_codex_quotas` | true | preflight Codex's app-server quota API before spending a turn |
 | `failure_review` | false | on a failed trusted check or terminal worker error, ask one advisory checker whether to retry or block |
@@ -69,12 +71,14 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 - `id`: unique within the plan, same slug pattern as plan `id`.
 - `provider`: must be exactly one of `codex`, `claude`, `antigravity` — no other values are accepted.
 - `files`: non-empty, no duplicates. These are the *only* paths the worker is allowed to write; any other changed/untracked file in the worktree aborts the run with "Unexpected changes in managed worktree." Paths are validated against path traversal (`safe_path`) — no `..`, no absolute paths.
-- `check`: a non-empty **argv list** (not a shell string) run inside the task's worktree with cwd = workspace. Must exit 0 to accept the task; treat this as the real acceptance test — the worker's code is never trusted without it. On failure, the task returns to `pending` and the next tick retries with the check's stderr/stdout fed back into the prompt as "Previous attempt failed."
-- `prompt`: task-specific instructions. The engine wraps it with a system preamble telling the worker to return only `{"files": [{"path": ..., "content": ...}]}` for exactly the given `files` — do not ask the user to also specify output format, that's automatic.
+- `check`: a non-empty **argv list** (not a shell string) run inside the task's worktree with cwd = workspace. It must be committed before the run and must not be one of the worker-writable `files`. On failure, the worker's changes are rolled back and the next attempt receives the check output.
+- `prompt`: task-specific implementation instructions. Workers use normal repository tools and edit the managed worktree directly; delegation and subagents remain disabled. Do not request a JSON/file-bundle response.
 
 Optional per-task fields:
-- `context_files`: list of paths (relative to the workspace) whose current contents (first 30000 chars each) get appended to the prompt as read-only context — use for files earlier tasks produced that a later task should build on.
+- `context_files`: optional paths whose current contents (first 30000 chars each) are emphasized in the prompt. Workers can inspect the repository themselves, so use this only when highlighting specific earlier-task output helps.
 - `quota_bucket`: which Codex rate-limit bucket to preflight-check (default `"codex"`), only relevant when `provider` is `codex`.
+- `effort`: `low`, `medium`, or `high` (default `low`). Antigravity model tier suffixes select matching effort automatically; an explicit conflicting value is rejected.
+- `max_file_shrink_fraction`: largest allowed size reduction for an existing file of at least 1000 bytes (default `0.5`). Set `allow_large_deletions: true` only when substantial deletion is explicitly intended.
 
 ## Failure review
 
@@ -110,7 +114,7 @@ Tasks run **sequentially** in array order within one `tick`. A task can only rel
 ## Writing a good `check`
 
 The check is a trusted local script or command, not a prompt hint. Patterns:
-- A standalone verifier script (see `examples/verify_clamp.py`) invoked as `["python3", "examples/verify_clamp.py", "demo/output.py"]` — it should import/exec the generated file and assert behavior, exiting non-zero with a readable message on failure (that message is what gets fed back to the worker on retry).
+- A pre-existing standalone verifier script (see `examples/verify_clamp.py`) invoked as `["python3", "examples/verify_clamp.py", "demo/output.py"]` — it should import/exec the generated file and assert behavior, exiting non-zero with a readable message on failure. Never let a task write its own verifier.
 - An existing test command scoped to the new file(s), e.g. `["python3", "-m", "pytest", "tests/test_widget.py", "-x"]`.
 - Keep checks fast — they run on every attempt, up to `max_attempts` times per task, and gate the final milestone-wide regression pass too (every task's `check` re-runs once more before `ready_for_pr`).
 

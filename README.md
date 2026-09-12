@@ -17,6 +17,10 @@ python3 -m loop codex-quota
 
 The repository must have an initial commit and a clean working tree before a new milestone starts. The supplied plan asks three providers to implement a tiny Python `clamp` function. Each implementation must pass 11 independent acceptance cases before the supervisor commits it. A final pass checks the entire milestone.
 
+Workers use normal read, search, edit, and command tools inside the isolated managed worktree. Delegation and subagent tools remain disabled. The supervisor verifies that `HEAD` did not move, rejects changes outside each task's `files` allowlist, blocks suspicious truncation of existing files, runs the trusted check, and commits only accepted changes. Failed and interrupted attempts are rolled back before retrying.
+
+Plans that need ignored dependencies in each fresh worktree can define a one-time setup command, such as `"setup": ["npm", "ci", "--prefix", "frontend"]`. Setup must leave tracked and unignored files clean. `setup_timeout_seconds` defaults to 600 seconds.
+
 Generated code lives in `.agent-loop/worktrees/three-provider-smoke`, on branch `loop/three-provider-smoke`. Runtime state, quota observations, raw output, and the prepared PR body live under `.agent-loop/` and are ignored by Git. The same command resumes a saved plan and skips completed sections. Changing a saved plan requires a new plan ID.
 
 `--once` performs one scheduler tick and returns, which is useful for external schedulers. Without it, quota waits continue without model calls. `Ctrl-C` or `SIGTERM` stops the runner and retains progress. A blocked authentication or configuration error waits for repair; stop the runner, fix the issue, use `python3 -m loop retry RUN_ID TASK_ID`, and resume.
@@ -37,7 +41,7 @@ Claude Code quota telemetry is collected by the project status line into `.agent
 ## Scope of this prototype
 
 - Durable SQLite state, one supervisor lock per milestone, isolated Git worktrees, checks, section commits, crash reconciliation after a commit, and bounded repair attempts. Milestones with different plan ids run concurrently against the same repository; a short repository-wide lock serializes only the git plumbing that touches shared state, such as adding a worktree or fetching a PR base.
-- Official headless adapters for Codex, Claude Code, and Antigravity. Workers return a JSON file bundle; the supervisor validates the file paths, applies the code, runs checks, and commits. This intentionally small first version does not give workers an unrestricted shell.
+- Official headless adapters for Codex, Claude Code, and Antigravity. Workers edit their isolated worktree with normal coding tools while model delegation remains disabled. Provider sandboxes constrain execution, and the supervisor independently validates Git history, changed paths, suspicious file shrinkage, trusted checks, and commits.
 - Automatic Codex quota preflight through its documented app-server API, plus Claude Code status-line quota snapshots. Antigravity exposes usage in another form; the MVP handles its quota errors and manual reset holds.
 - Per-provider, per-milestone, and per-section token accounting and admission budgets. `provider_token_budgets` counts only the current plan's spend, so a concurrent milestone cannot exhaust it; a task's optional `token_budget` caps one section. Counts cover this supervisor's completed responses, not everything used by your other sessions. A running task can exceed the remaining local token budget; this is not a hard provider billing cap. Claude's reported dollar figure is an estimate, not proof of a charge.
 - One milestone per plan. Completion creates a PR body and a `ready_for_pr` state. Publishing and merging are a separate explicit release command, described in [the design](docs/DESIGN.md).
@@ -51,7 +55,7 @@ python3 -m loop publish three-provider-smoke --github OWNER/REPO --merge
 
 The first command pushes the milestone branch and creates/reuses its PR. The second additionally attempts a normal merge with an exact head SHA, a protected base branch, and nonempty passing required checks. It returns a waiting state when checks are incomplete; invoke it again after CI completes. No `--admin` or force push is used. The release step does not yet run automatically inside the long-lived task loop.
 
-Run only trusted plans: the acceptance-check commands execute locally. Path restrictions protect file application; they are not an OS sandbox for the acceptance tests. Do not put secrets in prompts or in generated files.
+Run only trusted plans: setup and acceptance-check commands execute locally. Provider sandboxes reduce worker risk, but checks can execute changed application code. A task may not modify the check file it invokes. Do not put secrets in prompts or generated files.
 
 ## Optional self-review
 
