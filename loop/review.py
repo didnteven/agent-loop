@@ -32,9 +32,13 @@ VERDICT_INSTRUCTIONS = (
 )
 
 
-def _ask(provider, model, prompt, cwd, timeout):
-    code, out, err = run_process(command(provider, prompt, model), cwd, timeout)
+def _ask(provider, model, prompt, cwd, timeout, engine=None, run_id="review", task_id="review"):
+    invocation_id = (engine.begin_invocation(run_id, task_id, 1, "review", provider, model, "low")
+                     if engine else None)
+    code, out, err = run_process(command(provider, prompt, model, worker=False), cwd, timeout)
     result = parse(provider, code, out, err)
+    if invocation_id:
+        engine.finish_invocation(invocation_id, result)
     if result.status != "ok":
         raise RuntimeError("Review call failed: " + (result.error or result.response or err)[-2000:])
     text = result.response.strip()
@@ -55,8 +59,9 @@ PLAN_REVIEW_PROMPT = (
 )
 
 
-def review_plan(provider, model, plan, cwd, timeout=180):
-    return _ask(provider, model, PLAN_REVIEW_PROMPT + json.dumps(plan, indent=2), cwd, timeout)
+def review_plan(provider, model, plan, cwd, timeout=180, engine=None):
+    return _ask(provider, model, PLAN_REVIEW_PROMPT + json.dumps(plan, indent=2), cwd, timeout,
+                engine, plan.get("id", "review"), "plan")
 
 
 PR_REVIEW_PROMPT = (
@@ -70,12 +75,13 @@ PR_REVIEW_PROMPT = (
 )
 
 
-def review_pr(provider, model, plan, workspace, base_sha, timeout=180):
+def review_pr(provider, model, plan, workspace, base_sha, timeout=180, engine=None):
     diff = git(workspace, "diff", base_sha, "HEAD")
     tasks = [{"id": t["id"], "prompt": t["prompt"], "files": t["files"]} for t in plan["tasks"]]
     prompt = (PR_REVIEW_PROMPT + "TASKS:\n" + json.dumps(tasks, indent=2)
               + "\n\nDIFF:\n" + diff[:20000])
-    return _ask(provider, model, prompt, workspace, timeout)
+    return _ask(provider, model, prompt, workspace, timeout, engine,
+                plan.get("id", "review"), "release")
 
 
 FAILURE_REVIEW_INSTRUCTIONS = (
@@ -86,14 +92,19 @@ FAILURE_REVIEW_INSTRUCTIONS = (
 )
 
 
-def review_failure(provider, model, task, failure, workspace, timeout=180):
+def review_failure(provider, model, task, failure, workspace, timeout=180,
+                   engine=None, run_id="review"):
     """Return an advisory retry/block recommendation after a worker or check failure."""
     diff = git(workspace, "diff", "HEAD", "--", *task["files"])
     prompt = (FAILURE_REVIEW_INSTRUCTIONS + "TASK:\n" + json.dumps(
         {key: task.get(key) for key in ("id", "files", "prompt", "check")}, indent=2)
         + "\n\nFAILURE:\n" + failure[-4000:] + "\n\nUNCOMMITTED DIFF:\n" + diff[:20000])
-    code, out, err = run_process(command(provider, prompt, model), workspace, timeout)
+    invocation_id = (engine.begin_invocation(run_id, task["id"], 1, "review",
+                                             provider, model, "low") if engine else None)
+    code, out, err = run_process(command(provider, prompt, model, worker=False), workspace, timeout)
     result = parse(provider, code, out, err)
+    if invocation_id:
+        engine.finish_invocation(invocation_id, result)
     if result.status != "ok":
         raise RuntimeError("Failure review call failed: " + (result.error or result.response or err)[-2000:])
     text = result.response.strip()

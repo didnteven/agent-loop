@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "description": "Independent evaluation fixtures. Pinned by the baseline installation and outside every improvement worker's write roots; a candidate may add tests elsewhere but cannot edit these.",
+  "thresholds": {
+    "regressed_fixtures": 0,
+    "completion_rate_drop": 0.05,
+    "tokens_per_acceptance_increase": 0.0
+  },
+  "fixtures": [
+    {
+      "id": "enforcement-suite",
+      "argv": ["python3", "-m", "unittest", "tests.test_loop", "-q"],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "roadmap-suite",
+      "argv": ["python3", "-m", "unittest", "tests.test_roadmap", "-q"],
+      "timeout_seconds": 900
+    }
+  ]
+}
