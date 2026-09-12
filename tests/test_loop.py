@@ -3,13 +3,16 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from loop.adapters import (Result, claude_limits, command, parse, quota_deadline,
-                           run_process, token_total)
+from loop.adapters import (Result, antigravity_limits, claude_limits, command,
+                           parse, provider_limits, quota_deadline, run_process, runner_command,
+                           token_total)
 from loop.engine import Engine, git, safe_path, validate_plan
+from loop.planner import create_plan, validate_generated_plan
 from loop.release import checks_pass, publish, validate_remote
 from loop.review import review_failure, review_plan
+from tests.support import isolate_registry
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "concurrent_worker.py"
@@ -40,6 +43,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result.status, "rate_limited")
         self.assertEqual(result.retry_at, 0)
 
+    def test_interrupted_provider_stream_is_transient(self):
+        result = parse("antigravity", 1, "", "The stream was interrupted. Please continue the task.")
+        self.assertEqual(result.status, "transient")
+
     def test_claude_limits_reads_statusline_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / ".agent-loop"
@@ -47,11 +54,101 @@ class AdapterTests(unittest.TestCase):
             (snapshot / "claude-quota.json").write_text(json.dumps({
                 "rate_limits": {"five_hour": {"used_percentage": 100, "resets_at": 200}}
             }))
-            self.assertEqual(claude_limits(directory)["rate_limits"]["five_hour"]["resets_at"], 200)
+            with patch("loop.adapters.run_process", return_value=(1, "", "offline")):
+                self.assertEqual(claude_limits(directory)["rate_limits"]["five_hour"]["resets_at"], 200)
+
+    def test_claude_limits_falls_back_to_official_usage_command(self):
+        usage = {
+            "result": "Current session: 82% used · resets Sep 12 at 1:50pm (Pacific/Auckland)\n"
+                       "Current week (all models): 41% used · resets Sep 16 at 5pm"
+        }
+        with patch("loop.adapters.run_process",
+                   return_value=(0, json.dumps(usage), "")) as run:
+            limits = claude_limits(tempfile.gettempdir())
+        self.assertEqual(limits["rate_limits"]["primary"]["usedPercent"], 82)
+        self.assertEqual(limits["rate_limits"]["secondary"]["usedPercent"], 41)
+        self.assertEqual(run.call_args.args[0][:3], ["claude", "-p", "/usage"])
+
+    def test_antigravity_limits_converts_installed_utility_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            utility = Path(directory)
+            runner = utility / "node_modules" / ".bin"
+            runner.mkdir(parents=True)
+            (runner / "tsx").write_text("")
+            (utility / "src").mkdir()
+            (utility / "src" / "index.ts").write_text("")
+            payload = {"models": [{"remainingPercentage": 0.25,
+                                    "resetTime": "2026-09-12T02:00:00Z"}]}
+            pretty = "Antigravity quota follows\n" + json.dumps(payload, indent=2)
+            with patch.dict("os.environ", {"AGENT_LOOP_ANTIGRAVITY_USAGE_DIR": directory}), \
+                    patch("loop.adapters.run_process", return_value=(0, pretty, "")):
+                limits = antigravity_limits(tempfile.gettempdir())
+        self.assertEqual(limits["rate_limits"]["models"][0]["usedPercent"], 75)
+
+    def test_provider_limits_dispatches_every_supported_provider(self):
+        with patch("loop.adapters.codex_limits", return_value={"codex": 1}) as codex, \
+                patch("loop.adapters.claude_limits", return_value={"claude": 1}) as claude, \
+                patch("loop.adapters.antigravity_limits", return_value={"antigravity": 1}) as agy:
+            self.assertEqual(provider_limits("codex", "."), {"codex": 1})
+            self.assertEqual(provider_limits("claude", "."), {"claude": 1})
+            self.assertEqual(provider_limits("antigravity", "."), {"antigravity": 1})
+            self.assertTrue(codex.called and claude.called and agy.called)
+
+    def test_two_pass_planner_uses_context_then_strong_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "answer.py").write_text("answer = 1\n")
+            plan = {"id": "planned-change", "tasks": [{
+                "id": "change", "provider": "codex", "files": ["answer.py"],
+                "prompt": "make the requested change", "check": ["python3", "-c", "pass"]
+            }]}
+            calls = []
+            def fake_ask(provider, model, prompt, cwd, timeout, effort):
+                calls.append((provider, model, effort, prompt))
+                return ("repository notes", {}) if len(calls) == 1 else (json.dumps(plan), {})
+            with patch("loop.planner.live_provider_usage", return_value={"codex": {"status": "ok"}, "claude": {"status": "ok"}, "antigravity": {"status": "ok"}}), \
+                    patch("loop.planner.ask", side_effect=fake_ask):
+                result = create_plan(directory, "fix the button", timeout=1)
+        self.assertEqual(result["id"], "planned-change")
+        self.assertEqual([(call[0], call[2]) for call in calls],
+                         [("antigravity", "low"), ("antigravity", "high")])
+        self.assertIn("repository notes", calls[1][3])
+
+    def test_generated_plan_can_create_file_inside_default_root(self):
+        plan = {"id": "planned-change", "tasks": [{
+            "id": "change", "provider": "codex", "files": ["missing.py"],
+            "prompt": "make the requested change", "check": ["python3", "-c", "pass"]
+        }]}
+        with tempfile.TemporaryDirectory() as directory:
+            validate_generated_plan(plan, Path(directory))
+
+    def test_provider_runner_is_the_only_real_worker_launcher(self):
+        argv = runner_command("codex", ["codex", "exec", "work"], "/repo", 123, 456,
+                              "base_model_inference")
+        self.assertIn("scripts/run_provider.py", argv[1])
+        self.assertEqual(argv[argv.index("--provider") + 1], "codex")
+        self.assertEqual(argv[argv.index("--quota-bucket") + 1], "base_model_inference")
 
     def test_arguments_are_not_shell_code(self):
         prompt = 'literal $(whoami) `date` "quotes"'
         self.assertTrue(any(prompt in argument for argument in command("claude", prompt)))
+
+    def test_model_and_prompt_order_matches_each_cli(self):
+        for provider, model in (("codex", "gpt-5.6-luna"),
+                                ("claude", "claude-sonnet-5")):
+            argv = command(provider, "Return JSON only", model)
+            model_index = argv.index("--model")
+            self.assertEqual(argv[model_index + 1], model)
+            self.assertTrue(argv[model_index + 2].startswith("Return JSON only"))
+        antigravity = command("antigravity", "Return JSON only", "gemini-3.1-pro-high")
+        prompt_index = next(i for i, arg in enumerate(antigravity)
+                            if arg.startswith("Return JSON only"))
+        self.assertEqual(antigravity[prompt_index - 1], "-p")
+        self.assertEqual(antigravity[antigravity.index("--model") + 1], "gemini-3.1-pro-high")
+
+    def test_planning_commands_forbid_edits_without_worker_instructions(self):
+        prompt = command("codex", "Make a plan", worker=False)[-1]
+        self.assertIn("Do not edit files", prompt)
+        self.assertNotIn("managed worktree directly", prompt)
 
     def test_worker_commands_enable_tools_but_disable_delegation(self):
         codex = command("codex", "work")
@@ -64,7 +161,14 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("", claude)
         antigravity = command("antigravity", "work")
         self.assertIn("accept-edits", antigravity)
-        self.assertIn("--sandbox", antigravity)
+        # A headless agy worker cannot answer a permission prompt, so without
+        # auto-approval every command it attempts is denied and it produces
+        # nothing. --sandbox forces exactly that and the two flags cannot be
+        # combined, so a worker gets auto-approval and restriction comes from
+        # the managed worktree and the supervisor's checks instead.
+        self.assertIn("--dangerously-skip-permissions", antigravity)
+        self.assertNotIn("--sandbox", antigravity)
+        self.assertIn("--sandbox", command("antigravity", "work", sandbox=True))
 
     def test_antigravity_model_tier_selects_matching_effort(self):
         argv = command("antigravity", "work", "gemini-3.1-pro-high")
@@ -73,6 +177,14 @@ class AdapterTests(unittest.TestCase):
     def test_timeout_is_bounded(self):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
+
+    def test_noninteractive_processes_receive_eof_not_a_live_stdin_pipe(self):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate.return_value = ("ok", "")
+        with patch("loop.adapters.subprocess.Popen", return_value=proc) as popen:
+            self.assertEqual(run_process(["tool"], tempfile.gettempdir()), (0, "ok", ""))
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
     def test_merge_requires_real_passing_checks(self):
         self.assertFalse(checks_pass([]))
@@ -131,6 +243,7 @@ class AdapterTests(unittest.TestCase):
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        isolate_registry(self)
         self.repo = Path(self.temp.name)
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         git(self.repo, "checkout", "-q", "-B", "main")
@@ -176,6 +289,12 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.tick(self.plan, self.good_worker, now=501)[0], "progress")
         self.assertEqual(self.calls, 2)
 
+    def test_provider_runner_receives_the_task_quota_bucket(self):
+        task = dict(self.plan["tasks"][0], quota_bucket="base_model_inference")
+        argv = runner_command(task["provider"], ["codex", "exec", "work"], self.repo,
+                              180, 1800, task["quota_bucket"])
+        self.assertEqual(argv[argv.index("--quota-bucket") + 1], "base_model_inference")
+
     def test_commit_reconciles_database_crash(self):
         self.engine.tick(self.plan, self.good_worker)
         self.engine.set_task("test", "one", status="running", sha=None)
@@ -187,7 +306,7 @@ class EngineTests(unittest.TestCase):
             return Result("ok", '{"files":[{"path":"answer.py","content":"def add(a,b): return 0"}]}')
         for _ in range(3):
             self.engine.tick(self.plan, bad)
-        self.assertEqual(self.engine.tick(self.plan, bad)[0], "blocked")
+        self.assertEqual(self.engine.tick(self.plan, bad)[0], "parked")
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
 
@@ -275,15 +394,15 @@ class EngineTests(unittest.TestCase):
         workspace = self.engine.home / "worktrees" / "test"
         self.assertFalse((workspace / "setup-damage").exists())
 
-    def test_failure_review_can_block_a_failed_check(self):
+    def test_failure_review_advises_without_blocking_a_failed_check(self):
         self.plan["failure_review"] = True
         def bad(*_):
             return Result("ok", '{"files":[{"path":"answer.py","content":"def add(a,b): return 0"}]}')
         with patch.object(self.engine, "review_failure",
                           return_value={"retry": False, "reasoning": "The task is underspecified."}):
-            self.assertEqual(self.engine.tick(self.plan, bad)[0], "blocked")
+            self.assertEqual(self.engine.tick(self.plan, bad)[0], "progress")
         row = self.engine.status()["tasks"][0]
-        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["status"], "pending")
         self.assertIn("underspecified", row["error"])
 
     def test_one_supervisor_per_milestone_but_not_per_repository(self):
@@ -335,7 +454,7 @@ class EngineTests(unittest.TestCase):
 
     def test_task_budget_is_its_own_admission_gate(self):
         self.plan["tasks"][0]["token_budget"] = 0
-        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "blocked")
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "parked")
         self.assertEqual(self.calls, 0)
         self.assertIn("this section", self.engine.status()["tasks"][0]["error"])
 
@@ -370,7 +489,7 @@ class EngineTests(unittest.TestCase):
 
     def test_budget_is_admission_gate(self):
         self.plan["provider_token_budgets"] = {"codex":0}
-        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "blocked")
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "parked")
         self.assertEqual(self.calls, 0)
 
     def test_changed_plan_is_rejected(self):
@@ -386,7 +505,7 @@ class EngineTests(unittest.TestCase):
         def regressing(*_):
             return Result("ok", '{"files":[{"path":"answer.py","content":"def add(a,b): return 0"}]}')
         self.engine.tick(self.plan, regressing)
-        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "blocked")
+        self.assertEqual(self.engine.tick(self.plan, self.good_worker)[0], "parked")
         row = self.engine.status()["tasks"][0]
         self.assertIn("Milestone regression", row["error"])
         self.engine.set_task("test", "one", status="pending", attempts=0)

@@ -1,10 +1,13 @@
 """Official CLI adapters. No credential extraction or private quota endpoints."""
 import json
 import os
+import re
 import selectors
 import signal
 import subprocess
+import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 
 
@@ -16,11 +19,13 @@ class Result:
     retry_at: float = 0
     error: str = ""
     estimated_usd: float = 0
+    invoked: bool = True
 
 
 def run_process(argv, cwd, timeout=180, stdin=None):
     """Bound the whole process group; never interpolate prompts into a shell."""
-    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE,
+    proc = subprocess.Popen(argv, cwd=cwd,
+                            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
     try:
@@ -38,21 +43,30 @@ def run_process(argv, cwd, timeout=180, stdin=None):
         return 124, out, err + "\nworker timeout"
 
 
-def command(provider, prompt, model=None, effort=None):
+def command(provider, prompt, model=None, effort=None, worker=True, sandbox=False,
+            workspace=None):
     effort = effort or (model.rsplit("-", 1)[-1]
                         if provider == "antigravity" and model
                         and model.rsplit("-", 1)[-1] in ("low", "medium", "high")
                         else "low")
-    prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
-               "teammate, agent, or secondary model. Complete this task in the "
-               "current session. Use your repository tools to inspect and edit the "
-               "managed worktree directly. Do not commit, change branches, or edit "
-               "outside the allowed files. Finish with a concise summary.")
+    if worker:
+        prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
+                   "teammate, agent, or secondary model. Complete this task in the "
+                   "current session. Use your repository tools to inspect and edit the "
+                   "managed worktree directly. Do not commit, change branches, or edit "
+                   "outside the allowed files. Finish with a concise summary.")
+    else:
+        prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
+                   "teammate, agent, or secondary model. Do not edit files, commit, or "
+                   "change branches. Return only the requested response.")
     if provider == "codex":
         argv = ["codex", "exec", "--ignore-user-config", "--ephemeral", "--json",
                 "--disable", "multi_agent", "--disable", "multi_agent_v2",
                 "-s", "workspace-write", "-c", 'approval_policy="never"',
-                "-c", 'model_reasoning_effort="' + effort + '"', prompt]
+                "-c", 'model_reasoning_effort="' + effort + '"']
+        if model:
+            argv += ["--model", model]
+        argv.append(prompt)
     elif provider == "claude":
         argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "default",
                 "--disallowed-tools", "Agent", "--safe-mode", "--no-session-persistence",
@@ -60,13 +74,77 @@ def command(provider, prompt, model=None, effort=None):
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
-                "--sandbox", "--disable-slash-commands", "--effort", effort,
-                "--print-timeout", "150s"]
+                "--disable-slash-commands", "--effort", effort, "--print-timeout", "150s"]
+        if workspace:
+            # Without this, agy edits files inside its own project scratch
+            # directory and ignores the process working directory entirely, so
+            # the managed worktree is never touched and every task fails on a
+            # missing file. Binding the workspace is what makes it edit in place.
+            argv += ["--add-dir", str(workspace)]
+        if sandbox:
+            # Terminal restrictions. Measured behaviour: with --sandbox the CLI
+            # denies every run_command in headless mode, including the `pwd` the
+            # model issues to orient itself, and the worker then produces
+            # nothing. It is offered because the caller may want it, but it
+            # cannot be combined with auto-approval (the CLI rejects both flags
+            # together) and a worker under it will usually fail.
+            argv.append("--sandbox")
+        elif worker:
+            # Parity with the other two adapters, which already run unattended:
+            # codex uses approval_policy="never" and claude --permission-prompts
+            # none. Headless agy cannot answer a permission prompt, so without
+            # this any command it attempts is auto-denied and the task fails.
+            # Containment is the managed worktree plus the supervisor's
+            # allowlist, history and truncation checks, not this flag.
+            argv.append("--dangerously-skip-permissions")
     else:
         raise ValueError("Unknown provider: " + provider)
-    if model:
+    if model and provider == "antigravity":
+        # agy's -p consumes the very next token as its prompt.
         argv += ["--model", model]
+    elif model and provider != "codex":
+        prompt_index = argv.index(prompt)
+        argv[prompt_index:prompt_index] = ["--model", model]
     return argv
+
+
+def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=1800,
+                   quota_bucket="codex"):
+    """Run one provider through the quota-aware provider boundary.
+
+    The engine deliberately does not launch provider CLIs itself.  This small
+    script is the only layer that knows how to wait for a provider reset and
+    then re-run its command.
+    """
+    runner = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts",
+                          "run_provider.py")
+    return [sys.executable, runner, "--repo", str(workspace), "--provider", provider,
+            "--timeout", str(timeout), "--unknown-retry-seconds",
+            str(unknown_retry_seconds), "--quota-bucket", quota_bucket, "--", *argv]
+
+
+def usage_fraction(data):
+    """The most-consumed quota window, as a fraction in [0, 1].
+
+    Returns None when no window reports a usage percentage: unknown headroom is
+    unknown, and must not be read as "plenty left".
+    """
+    seen = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            used = value.get("usedPercent", value.get("used_percentage"))
+            if isinstance(used, (int, float)):
+                seen.append(max(0.0, min(1.0, used / 100.0)))
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data)
+    # The binding constraint is the window closest to exhaustion.
+    return max(seen) if seen else None
 
 
 def quota_deadline(data, now=None):
@@ -89,14 +167,146 @@ def quota_deadline(data, now=None):
     return max(deadlines, default=0)
 
 
-def claude_limits(cwd):
-    """Read the latest Claude Code status-line snapshot for a workspace."""
+def _json_from_output(output):
+    """Decode a JSON object even when a CLI adds harmless log lines."""
+    # Some CLIs print a label or ANSI-colored status before pretty JSON.
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    decoder = json.JSONDecoder()
+    candidates = [index for index, char in enumerate(cleaned) if char == "{"]
+    for index in candidates:
+        try:
+            value, _ = decoder.raw_decode(cleaned[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("Provider did not return a JSON object")
+
+
+def _claude_usage_snapshot(cwd, timeout=30):
+    code, out, err = run_process(
+        ["claude", "-p", "/usage", "--output-format", "json", "--no-session-persistence"],
+        cwd, timeout)
+    if code:
+        raise RuntimeError((out + err)[-2000:] or "Claude usage command failed")
+    return _json_from_output(out)
+
+
+def _parse_claude_reset(value, now=None):
+    """Parse Claude's human-readable local reset into a Unix timestamp."""
+    now = datetime.now().astimezone() if now is None else datetime.fromtimestamp(now).astimezone()
+    match = re.search(r"resets\s+([A-Z][a-z]{2}\s+\d{1,2}\s+at\s+\d{1,2}:\d{2}\s*[ap]m)", value)
+    if not match:
+        return None
+    parsed = datetime.strptime(match.group(1), "%b %d at %I:%M%p").replace(
+        year=now.year, tzinfo=now.tzinfo)
+    if parsed.timestamp() < now.timestamp() - 86400:
+        parsed = parsed.replace(year=now.year + 1)
+    return parsed.timestamp()
+
+
+def claude_limits(cwd, timeout=30):
+    """Read Claude's official headless /usage data, with a snapshot fallback."""
     path = os.path.join(cwd, ".agent-loop", "claude-quota.json")
-    with open(path, encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict) or not isinstance(data.get("rate_limits"), dict):
-        raise ValueError("Claude quota snapshot has no rate_limits object")
-    return data
+    try:
+        data = _claude_usage_snapshot(cwd, timeout)
+        text = str(data.get("result", ""))
+        windows = {}
+        for label, key in (("Current session", "primary"), ("Current week", "secondary")):
+            label_pattern = re.escape(label) + (r"(?:\s+\(all models\))?" if label == "Current week" else "")
+            match = re.search(label_pattern + r":\s*(\d+)% used", text)
+            if match:
+                window = {"usedPercent": int(match.group(1))}
+                reset = _parse_claude_reset(text[text.find(label):])
+                if reset:
+                    window["resetsAt"] = reset
+                windows[key] = window
+        if not windows:
+            raise ValueError("Claude /usage returned no recognizable rate-limit windows")
+        return {"rate_limits": windows, "source": "claude /usage", "raw": data}
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        if not os.path.exists(path):
+            raise
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict) or not isinstance(data.get("rate_limits"), dict):
+            raise ValueError("Claude quota snapshot has no rate_limits object")
+        return data
+
+
+def antigravity_limits(cwd, timeout=30):
+    """Read Antigravity quota through the installed local utility's JSON interface."""
+    utility = os.environ.get("AGENT_LOOP_ANTIGRAVITY_USAGE_DIR", "/tmp/antigravity-usage")
+    runner = os.path.join(utility, "node_modules", ".bin", "tsx")
+    entrypoint = os.path.join(utility, "src", "index.ts")
+    if not os.path.isfile(runner) or not os.path.isfile(entrypoint):
+        raise FileNotFoundError(
+            "Antigravity quota utility is not installed; set AGENT_LOOP_ANTIGRAVITY_USAGE_DIR")
+    code, out, err = run_process(
+        [runner, entrypoint, "quota", "--json", "--method", "local"], cwd, timeout)
+    if code:
+        raise RuntimeError((out + err)[-2000:] or "Antigravity quota command failed")
+    data = _json_from_output(out)
+    models = data.get("models", [])
+    windows = []
+    for model in models:
+        remaining = model.get("remainingPercentage")
+        if not isinstance(remaining, (int, float)):
+            continue
+        window = {"usedPercent": max(0, min(100, (1 - remaining) * 100))}
+        reset = model.get("resetTime")
+        if isinstance(reset, str):
+            try:
+                window["resetsAt"] = datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        windows.append(window)
+    if not windows:
+        raise ValueError("Antigravity quota returned no model windows")
+    return {"rate_limits": {"models": windows}, "source": "antigravity-usage", "raw": data}
+
+
+AUTH_PROBES = {
+    "codex": ["codex", "login", "status"],
+    "claude": ["claude", "auth", "status"],
+    "antigravity": ["agy", "auth", "status"],
+}
+
+
+def auth_probe(provider, cwd, timeout=30):
+    """Ask the CLI whether credentials work, without starting an inference turn.
+
+    Returns True (authenticated), False (not authenticated) or None (the probe
+    itself is unavailable, which is unknown rather than either answer).
+    """
+    argv = AUTH_PROBES.get(provider)
+    if not argv:
+        return None
+    try:
+        code, out, err = run_process(argv, cwd, timeout)
+    except (OSError, ValueError):
+        return None
+    text = (out + err).lower()
+    if any(phrase in text for phrase in ("unknown command", "unrecognized", "usage:",
+                                         "no such command")):
+        return None
+    if code == 0 and not any(phrase in text for phrase in (
+            "not logged in", "logged out", "no credentials", "please run")):
+        return True
+    if any(phrase in text for phrase in ("not logged in", "logged out", "no credentials",
+                                         "authentication required", "please run")):
+        return False
+    return None
+
+
+def provider_limits(provider, cwd, timeout=30):
+    if provider == "codex":
+        return codex_limits(cwd, timeout)
+    if provider == "claude":
+        return claude_limits(cwd, timeout)
+    if provider == "antigravity":
+        return antigravity_limits(cwd, timeout)
+    raise ValueError("Unknown provider: " + provider)
 
 
 def parse(provider, code, out, err, now=None):
@@ -127,8 +337,28 @@ def parse(provider, code, out, err, now=None):
                 success = event.get("type") == "result" and not event.get("is_error", True)
             else:
                 success = event.get("status") == "SUCCESS"
+            denied = event.get("denied_actions")
+            if isinstance(denied, list) and denied:
+                # Antigravity reports SUCCESS even when its sandbox denied every
+                # action the worker attempted. A run that was not allowed to act
+                # is an environment fault, not a completed turn: reporting it as
+                # ok costs another attempt and a review call to rediscover.
+                names = sorted({str(item.get("display_name") or item.get("action"))
+                                for item in denied if isinstance(item, dict)})
+                errors.append("Provider denied worker actions: " + ", ".join(names)
+                              + ". Permission denied by the provider sandbox.")
+                success = False
             if event.get("is_error") or event.get("error"):
                 errors.append(str(event.get("error", response)))
+    waits = [event for event in events if event.get("agent_loop_result") == "provider_wait"]
+    if code == 75 and len(waits) == 1:
+        wait = waits[0]
+        retry_at = wait.get("retry_at")
+        if not isinstance(retry_at, (int, float)) or retry_at <= now:
+            return Result("error", error="Invalid provider_wait envelope")
+        return Result("provider_wait", response, usage, retry_at,
+                      str(wait.get("reason", "Provider unavailable")), cost,
+                      bool(wait.get("invoked", False)))
     deadline = quota_deadline(events, now)
     if code == 0 and success and not errors:
         return Result("ok", response, usage, deadline, estimated_usd=cost)
@@ -138,11 +368,18 @@ def parse(provider, code, out, err, now=None):
         status = "auth_required"
     elif deadline or any(x in lower for x in ("rate_limit", "rate limit", "quota exhausted", "usage limit", "session limit", "weekly limit", "resource_exhausted")):
         status = "rate_limited"
-    elif code == 124 or any(x in lower for x in ("timed out", "connection", "overloaded", "503", "502")):
+    elif code == 124 or any(x in lower for x in (
+        "timed out", "connection", "stream was interrupted", "broken pipe", "overloaded", "503", "502")):
         status = "transient"
     else:
         status = "error"
     return Result(status, response, usage, deadline, message, cost)
+
+
+def asked_question(text):
+    tail = str(text or "").strip()[-400:]
+    return bool(tail) and (tail.endswith("?") or bool(re.search(
+        r"(?i)\b(should i|do you want|which (one|option)|please confirm|let me know)\b", tail)))
 
 
 def token_total(provider, usage):
@@ -157,7 +394,7 @@ def token_total(provider, usage):
 
 def codex_limits(cwd, timeout=20):
     """Read official app-server RPC, without starting an inference turn."""
-    proc = subprocess.Popen(["codex", "app-server"], cwd=cwd, stdin=subprocess.PIPE,
+    proc = subprocess.Popen(["codex", "app-server", "--stdio"], cwd=cwd, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     sel = selectors.DefaultSelector()
