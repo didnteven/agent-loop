@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--provider", choices=("codex", "claude", "antigravity"), required=True)
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--idle-timeout", type=int, default=None)
     parser.add_argument("--unknown-retry-seconds", type=int, default=1800)
     parser.add_argument("--quota-bucket", default="codex")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -50,7 +51,8 @@ def main():
     reset = quota_reset(args.provider, args.repo, args.timeout, args.quota_bucket)
     if reset:
         return provider_wait(reset, "Quota unavailable before dispatch", False)
-    code, out, err = run_process(command, args.repo, args.timeout)
+    code, out, err = run_process(command, args.repo, args.timeout,
+                                 idle_timeout=args.idle_timeout)
     result = parse(args.provider, code, out, err)
     sys.stdout.write(out)
     sys.stderr.write(err)

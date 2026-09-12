@@ -91,6 +91,51 @@ def restore_worker_attempt(workspace, head=None):
         restore_task_files(workspace, names)
 
 
+CONTINUE_PREFIX = "[continue:"
+
+
+def continuation_marker(error):
+    error = error or ""
+    if not error.startswith(CONTINUE_PREFIX):
+        return ""
+    return error[len(CONTINUE_PREFIX):].split("]", 1)[0]
+
+
+def previous_attempt_note(error):
+    if continuation_marker(error):
+        return ("\nThe previous attempt was stopped before it finished (timeout), not "
+                "rejected. Its in-progress edits to the allowed paths are still in the "
+                "worktree. Inspect them and continue from where it left off; do not "
+                "redo work that is already present and correct.\n" + error[-4000:])
+    return "\nPrevious attempt failed this trusted check; fix the issue:\n" + error[-4000:]
+
+
+def preserve_task_progress(workspace, head, allowed):
+    """Keep a stopped worker's edits to allowed files; discard everything else.
+
+    Returns a fingerprint of the kept edits, or "" when nothing in scope changed.
+    """
+    if head and git(workspace, "rev-parse", "HEAD") != head:
+        git(workspace, "reset", "--mixed", head)
+    changed = changed_files(workspace)
+    stray = changed - set(allowed)
+    if stray:
+        restore_task_files(workspace, stray)
+    return progress_fingerprint(workspace, changed & set(allowed))
+
+
+def progress_fingerprint(workspace, names):
+    if not names:
+        return ""
+    digest = hashlib.sha256()
+    for name in sorted(names):
+        target = safe_path(workspace, name)
+        digest.update(name.encode() + b"\0")
+        if target.is_file():
+            digest.update(target.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def file_snapshot(workspace, names):
     """Record pre-attempt file sizes.
 
@@ -839,6 +884,11 @@ class Engine:
             "context_characters": model_budget(json.loads(run["policy"]), task.get("model"),
                                                plan.get("context_characters")),
             "worker_timeout_seconds": self.worker_timeout(plan, task),
+            # A worker that is still emitting output is making progress; stop it
+            # only after a silent stretch, under a much larger hard cap.
+            "worker_idle_timeout_seconds": plan.get("worker_idle_timeout_seconds",
+                                                    self.worker_timeout(plan, task)),
+            "worker_max_seconds": plan.get("worker_max_seconds", 14400),
             "unknown_quota_retry_seconds": plan.get("unknown_quota_retry_seconds", 1800),
             "provider_runner_timeout_seconds": plan.get("provider_runner_timeout_seconds", 86400),
             "lease_seconds": plan.get("worker_lease_seconds", 86400),
@@ -1262,7 +1312,12 @@ class Engine:
                 continue
             # A failed check or interrupted process must never become the next
             # attempt's starting point. Managed worktrees are supervisor-owned.
-            if changed and carried is None:
+            # The one exception is progress preserved from a timed-out attempt,
+            # kept only while the worktree still matches its recorded fingerprint.
+            marker_fp = continuation_marker(row["error"])
+            resumable = (row["status"] == "pending" and marker_fp
+                         and progress_fingerprint(workspace, changed) == marker_fp)
+            if changed and carried is None and not resumable:
                 restore_task_files(workspace, task["files"])
             if row["status"] == "running" and carried is None:
                 self.set_task(plan["id"], task["id"], status="pending",
@@ -1327,9 +1382,7 @@ class Engine:
                              "You may modify only these paths: " + json.dumps(task["files"]) + ". "
                              "Do not commit or change branches.\n" + task["prompt"])]
                 if row["error"]:
-                    sections.append(("previous failure",
-                                     "\nPrevious attempt failed this trusted check; fix the issue:\n"
-                                     + row["error"][-4000:]))
+                    sections.append(("previous failure", previous_attempt_note(row["error"])))
                 for name in task.get("context_files", []):
                     sections.append(("context " + name, "\nCONTEXT " + name + "\n"
                                      + safe_path(workspace, name).read_text()))
@@ -1431,6 +1484,21 @@ class Engine:
                 self.event(plan["id"], task["id"], "waiting", deadline)
                 deadlines.append(deadline)
                 continue
+            if (result.status == "transient" and "timeout" in (result.error or "").lower()
+                    and carried is None):
+                progress = preserve_task_progress(workspace, head, task["files"])
+                previous = continuation_marker(row["error"])
+                if progress and progress != previous:
+                    # Stopped mid-work, not failed: keep its in-scope edits and
+                    # continue from them. The attempt is not a repair failure, and
+                    # an unchanged fingerprint falls through so a stuck worker ends.
+                    error = (CONTINUE_PREFIX + progress + "]\n"
+                             + (result.error or "")[-2000:])
+                    self.set_task(plan["id"], task["id"], status="pending",
+                                  attempts=row["attempts"], retry_at=0, error=error)
+                    self.event(plan["id"], task["id"], "continuing", progress)
+                    deadlines.append(now)
+                    continue
             if result.status != "ok":
                 restore_worker_attempt(workspace, head)
                 state = "waiting" if result.status == "transient" else "parked"

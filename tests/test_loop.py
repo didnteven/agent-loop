@@ -178,6 +178,21 @@ class AdapterTests(unittest.TestCase):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
 
+    def test_idle_timeout_stops_a_silent_process(self):
+        code, _, err = run_process(["python3", "-c", "import time; time.sleep(10)"],
+                                   tempfile.gettempdir(), 30, idle_timeout=0.3)
+        self.assertEqual(code, 124)
+        self.assertIn("idle timeout", err)
+
+    def test_idle_timeout_lets_a_process_that_keeps_producing_output_finish(self):
+        script = ("import sys, time\n"
+                  "for i in range(10):\n"
+                  "    print(i, flush=True); time.sleep(0.1)\n")
+        code, out, _ = run_process(["python3", "-c", script], tempfile.gettempdir(), 30,
+                                   idle_timeout=0.5)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), [str(i) for i in range(10)])
+
     def test_noninteractive_processes_receive_eof_not_a_live_stdin_pipe(self):
         proc = MagicMock()
         proc.returncode = 0
@@ -317,6 +332,38 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.tick(self.plan, tool_worker)[0], "progress")
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b): return a+b\n")
+
+    def test_timeout_keeps_in_scope_progress_and_next_attempt_continues(self):
+        calls = 0
+        def worker(_task, prompt, workspace):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                (workspace / "answer.py").write_text("def add(a,b):\n    pass\n")
+                (workspace / "stray.txt").write_text("outside the allowlist")
+                return Result("transient", error="worker idle timeout: no output for 300s")
+            self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b):\n    pass\n")
+            self.assertFalse((workspace / "stray.txt").exists())
+            self.assertIn("continue from where it left off", prompt)
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "finished")
+        self.engine.tick(self.plan, worker)
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual((row["status"], row["attempts"]), ("pending", 0))
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
+
+    def test_timeout_without_new_progress_is_not_resumed_forever(self):
+        def stuck(_task, _prompt, workspace):
+            (workspace / "answer.py").write_text("def add(a,b):\n    pass\n")
+            return Result("transient", error="worker timeout")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.engine.tick(self.plan, stuck)
+        self.assertTrue((workspace / "answer.py").exists())
+        self.engine.tick(self.plan, stuck)
+        self.assertFalse((workspace / "answer.py").exists())
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "waiting")
 
     def test_failed_check_rolls_back_before_retry(self):
         calls = 0

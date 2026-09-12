@@ -38,7 +38,11 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 |---|---|---|
 | `description` | — | free text, not used by the engine |
 | `max_attempts` | 3 | repair attempts per task before it's `blocked` |
-| `worker_timeout_seconds` | 180 | subprocess timeout per model call |
+| `worker_timeout_seconds` | 180 | default for `worker_idle_timeout_seconds` (and the auto-tune baseline) |
+| `worker_idle_timeout_seconds` | `worker_timeout_seconds` | stop a worker only after this many seconds with **no output**; a worker that keeps streaming keeps running |
+| `worker_max_seconds` | 14400 | hard wall-clock cap per model call |
+
+A worker stopped by either timeout is not treated as a failed repair: its edits to the task's allowed `files` are kept (anything else is discarded), the attempt count is not consumed, and the next attempt is told to continue from that work. If a timeout produces no new change since the previous one, it falls back to the normal transient-failure path so a stuck worker still terminates. Don't raise timeouts or split tasks just to survive slow work.
 | `check_timeout_seconds` | 30 | timeout for running each task's `check` |
 | `setup` | none | one-time argv command run in the fresh worktree before workers |
 | `setup_timeout_seconds` | 600 | timeout for the one-time setup command |

@@ -45,6 +45,8 @@ evaluates, promotes and rolls back candidate versions of the supervisor itself; 
 and accounting surfaces are fenced from improvement workers in code, and a candidate with no
 pinned independent fixtures is ineligible rather than deployed.
 
+Workers are stopped only after `worker_idle_timeout_seconds` without any output (default: `worker_timeout_seconds`), under a `worker_max_seconds` hard cap (default 4 hours). A stopped worker's edits to its allowed files are preserved and the next attempt continues from them without consuming a repair attempt; a timeout with no new progress falls back to the normal bounded transient retry.
+
 `--once` performs one scheduler tick and returns, which is useful for external schedulers. The top-level loop owns only durable plan state, validation, commits, and retries. Each model call goes through `scripts/run_provider.py`, which checks that provider's quota and sleeps until a known reset before launching or retrying the CLI. `Ctrl-C` or `SIGTERM` stops the runner and retains progress. A blocked authentication or configuration error exits and requires repair; use `python3 -m loop retry RUN_ID TASK_ID`, then resume.
 
 Plans can opt into `failure_review`. After a trusted check fails or a worker returns a terminal error, Python asks one configured checker provider whether the same immutable task should retry or block. This is advisory and runs only on failure; it cannot edit code, change the plan, or replace the trusted check.
