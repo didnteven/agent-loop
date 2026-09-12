@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -219,6 +220,9 @@ class AccountingTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -389,6 +393,9 @@ class DetachedWorkerTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -551,7 +558,7 @@ class SetupAndRegressionTests(unittest.TestCase):
             "from answer import value\nassert value == 42\n")
         # A real recipe installs into an ignored directory; the worktree must
         # stay clean afterwards.
-        (self.repo / '.gitignore').write_text('.deps-ready\n')
+        (self.repo / '.gitignore').write_text('.deps-ready\n__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -630,6 +637,9 @@ class RegressionRepairTests(unittest.TestCase):
             'from answer import value\nfrom other import flag\n'
             'assert value == 42 and flag is False\n')
         (self.repo / 'other.py').write_text('flag = False\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -802,6 +812,9 @@ class ProviderRecoveryTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -869,6 +882,9 @@ class ServiceTests(unittest.TestCase):
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
         (self.repo / 'verify_two.py').write_text('from second import value\nassert value == 7\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -984,6 +1000,9 @@ class LearningTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -1088,6 +1107,9 @@ class ImprovementTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'seed.txt').write_text('seed\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -1332,6 +1354,9 @@ class FailoverTests(unittest.TestCase):
         git(self.repo, 'config', 'user.name', 'Test')
         git(self.repo, 'config', 'user.email', 'test@example.invalid')
         (self.repo / 'verify.py').write_text('from answer import value\nassert value == 42\n')
+        # A trusted check that imports a module writes bytecode; an
+        # unignored .pyc makes the supervisor reject the check, as it should.
+        (self.repo / '.gitignore').write_text('__pycache__/\n')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-qm', 'initial')
         self.engine = Engine(self.repo)
@@ -1415,3 +1440,49 @@ class FailoverTests(unittest.TestCase):
         self.engine.hold('claude', now + 120, 'short by default, long for this plan', now)
         self.assertEqual(self.engine.tick(plan, self.good, now=now)[0], 'progress')
         self.assertEqual(self.used, ['antigravity'])
+
+
+class FixtureHygieneTests(unittest.TestCase):
+    """Guard against a whole class of platform-dependent test bug.
+
+    A trusted check that imports a module leaves `__pycache__/*.pyc`, and the
+    supervisor correctly refuses a check that mutated the workspace. Whether the
+    interpreter actually writes that file varies by platform and version, so a
+    fixture repository that does not ignore it passes on one machine and fails
+    on another. This asserts the property directly instead of waiting for CI.
+    """
+
+    def test_every_fixture_repository_ignores_bytecode(self):
+        source = Path(__file__).resolve()
+        text = source.read_text()
+        classes = re.findall(r"\nclass (\w+)\(unittest\.TestCase\):(.*?)(?=\nclass |\Z)",
+                             text, re.S)
+        checked = 0
+        for name, body in classes:
+            if "'git', 'init'" not in body:
+                continue
+            checked += 1
+            self.assertIn("__pycache__", body,
+                          name + " creates a repository without ignoring bytecode; a "
+                          "trusted check that imports a module will dirty its workspace")
+        self.assertGreater(checked, 5, "fixture scan found too few repositories to be trusted")
+
+    def test_a_bytecode_artifact_would_be_reported_without_the_ignore(self):
+        # The guard above only matters if an unignored .pyc really is treated as
+        # an unexpected change, so pin that behaviour here rather than assume it.
+        from loop.engine import changed_files
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / 'repo'
+            repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            git(repo, 'config', 'user.name', 'Test')
+            git(repo, 'config', 'user.email', 'test@example.invalid')
+            (repo / 'seed.txt').write_text('seed\n')
+            git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'initial')
+            cache = repo / '__pycache__'
+            cache.mkdir()
+            (cache / 'answer.cpython-311.pyc').write_bytes(b'\x00')
+            self.assertIn('__pycache__/answer.cpython-311.pyc', changed_files(repo))
+            (repo / '.gitignore').write_text('__pycache__/\n')
+            self.assertNotIn('__pycache__/answer.cpython-311.pyc', changed_files(repo))
