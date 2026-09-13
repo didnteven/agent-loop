@@ -42,7 +42,9 @@ The `loop` module itself doesn't need to be inside the target repo — invocatio
 | `worker_idle_timeout_seconds` | `worker_timeout_seconds` | stop a worker only after this many seconds with **no output**; a worker that keeps streaming keeps running |
 | `worker_max_seconds` | 14400 | hard wall-clock cap per model call |
 
-A worker stopped by either timeout is not treated as a failed repair: its edits to the task's allowed `files` are kept (anything else is discarded), the attempt count is not consumed, and the next attempt is told to continue from that work. If a timeout produces no new change since the previous one, it falls back to the normal transient-failure path so a stuck worker still terminates. Don't raise timeouts or split tasks just to survive slow work.
+A worker stopped by either timeout is not treated as a failed repair: its edits to the task's allowed `files` are kept (anything else is discarded), the attempt count is not consumed, and the next attempt is told to continue from that work. If a timeout produces no new change since the previous one, it falls back to the normal transient-failure path so a stuck worker still terminates. Don't raise timeouts or split tasks just to survive slow work. Writes to allowed files count as activity, live output is in `.agent-loop/logs/<run>/<attempt>.jsonl`, and a check-rejected attempt's files are saved to `.agent-loop/rejected/<run>/<task>/` for the next attempt.
+
+`files` must not be gitignored in the target repo (check with `git check-ignore -v <path>`); `validate_plan` rejects them because they can never be committed. Also remember gitignored *inputs* (e.g. generated screenshots) don't exist inside the managed worktree — reference them by absolute path in the main checkout.
 | `check_timeout_seconds` | 30 | timeout for running each task's `check` |
 | `setup` | none | one-time argv command run in the fresh worktree before workers |
 | `setup_timeout_seconds` | 600 | timeout for the one-time setup command |

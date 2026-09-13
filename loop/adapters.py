@@ -37,14 +37,17 @@ def _stop_group(proc):
         proc.wait()
 
 
-def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None):
+def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None, activity=None,
+                tee=None):
     """Bound the whole process group; never interpolate prompts into a shell.
 
     With ``idle_timeout``, a process that keeps producing output is left running
     until the hard ``timeout``; it is stopped only after ``idle_timeout`` seconds
-    with no stdout/stderr at all.
+    with no stdout/stderr and, when ``activity`` is given, no change in the value
+    it returns (e.g. file modification times). ``tee`` is an optional
+    ``(stdout_path, stderr_path)`` pair appended to as output arrives.
     """
-    if idle_timeout is None:
+    if idle_timeout is None and tee is None:
         proc = subprocess.Popen(argv, cwd=cwd,
                                 stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -73,11 +76,16 @@ def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None):
         except BrokenPipeError:
             pass
         proc.stdin.close()
+    idle_timeout = float("inf") if idle_timeout is None else idle_timeout
     chunks = {proc.stdout: [], proc.stderr: []}
+    sinks = {}
+    if tee:
+        sinks = {proc.stdout: open(tee[0], "ab"), proc.stderr: open(tee[1], "ab")}
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ)
     sel.register(proc.stderr, selectors.EVENT_READ)
     start = last_output = time.monotonic()
+    seen = activity() if activity else None
     reason = ""
     try:
         while sel.get_map():
@@ -86,13 +94,21 @@ def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None):
                 reason = "worker timeout"
                 break
             if now - last_output >= idle_timeout:
-                reason = "worker idle timeout: no output for %ds" % idle_timeout
-                break
+                current = activity() if activity else None
+                if activity and current != seen:
+                    # Silent but still writing files: that is progress too.
+                    seen, last_output = current, now
+                else:
+                    reason = "worker idle timeout: no output for %ds" % idle_timeout
+                    break
             wait = min(1.0, timeout - (now - start), idle_timeout - (now - last_output))
             for key, _ in sel.select(timeout=max(0.0, wait)):
                 data = os.read(key.fileobj.fileno(), 65536)
                 if data:
                     chunks[key.fileobj].append(data)
+                    if key.fileobj in sinks:
+                        sinks[key.fileobj].write(data)
+                        sinks[key.fileobj].flush()
                     last_output = time.monotonic()
                 else:
                     sel.unregister(key.fileobj)
@@ -101,6 +117,8 @@ def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None):
         raise
     finally:
         sel.close()
+        for sink in sinks.values():
+            sink.close()
     if reason:
         _stop_group(proc)
     else:
@@ -180,7 +198,7 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
 
 
 def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=1800,
-                   quota_bucket="codex", idle_timeout=None):
+                   quota_bucket="codex", idle_timeout=None, watch=()):
     """Run one provider through the quota-aware provider boundary.
 
     The engine deliberately does not launch provider CLIs itself.  This small
@@ -190,6 +208,8 @@ def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=180
     runner = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts",
                           "run_provider.py")
     idle = ["--idle-timeout", str(idle_timeout)] if idle_timeout else []
+    for name in watch:
+        idle += ["--watch", name]
     return [sys.executable, runner, "--repo", str(workspace), "--provider", provider,
             "--timeout", str(timeout), *idle, "--unknown-retry-seconds",
             str(unknown_retry_seconds), "--quota-bucket", quota_bucket, "--", *argv]

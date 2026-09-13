@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -124,6 +125,24 @@ def preserve_task_progress(workspace, head, allowed):
     return progress_fingerprint(workspace, changed & set(allowed))
 
 
+REJECTED_NOTE = "\n\nThe rejected attempt's versions of "
+
+
+def save_rejected_files(workspace, allowed, destination):
+    """Copy a rejected attempt's in-scope files outside the worktree before reset."""
+    kept = sorted(changed_files(workspace) & set(allowed))
+    shutil.rmtree(destination, ignore_errors=True)
+    saved = []
+    for name in kept:
+        source = safe_path(workspace, name)
+        if source.is_file():
+            target = Path(destination) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            saved.append(name)
+    return saved
+
+
 def progress_fingerprint(workspace, names):
     if not names:
         return ""
@@ -206,6 +225,16 @@ def fingerprint(text, workspace=None):
     return hashlib.sha256(value[:600].encode()).hexdigest()[:16]
 
 
+def ignored_paths(root, names):
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "check-ignore", "--", *names],
+                              capture_output=True, text=True)
+    except OSError:
+        return []
+    # Exit 1 means nothing is ignored; 128 means root is not a repository.
+    return proc.stdout.split() if proc.returncode == 0 else []
+
+
 def validate_plan(plan, root=None):
     root = Path.cwd() if root is None else Path(root).resolve()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", plan["id"]):
@@ -221,6 +250,12 @@ def validate_plan(plan, root=None):
             raise ValueError("Each task needs unique allowed files")
         for name in task["files"]:
             safe_path(root, name)
+        ignored = ignored_paths(root, task["files"])
+        if ignored:
+            # A gitignored output can never be committed, so the task could only
+            # ever fail after spending a full attempt.
+            raise ValueError("Task %s lists gitignored files that can never be committed: %s"
+                             % (task["id"], ", ".join(ignored)))
         if not isinstance(task.get("check"), list) or not task["check"]:
             raise ValueError("Every task needs a trusted check argv")
         if any(name in arg for name in task["files"]
@@ -1641,9 +1676,17 @@ class Engine:
                     self.event(plan["id"], task["id"], "needs_setup", failure)
                     return "progress", 0
                 verdict = self.review_failure(plan, task, workspace, failure) if count == 1 else None
+                saved = save_rejected_files(workspace, task["files"],
+                                            self.home / "rejected" / run["id"] / task["id"])
                 restore_worker_attempt(workspace, head)
                 if verdict:
                     failure = "Failure review: " + verdict["reasoning"] + "\nTrusted check: " + failure
+                evidence = failure
+                if saved:
+                    failure += (REJECTED_NOTE + ", ".join(saved)
+                                + " were saved under " + str(self.home / "rejected" / run["id"] / task["id"])
+                                + " (same relative paths). Read them and reuse whatever is "
+                                "correct instead of starting over; the worktree itself was reset.")
                 if count >= 2:
                     policy = json.loads(run["policy"])
                     choices = policy.get("models", [])
@@ -1662,7 +1705,9 @@ class Engine:
                                       selected_effort=next_model.get("effort", "low"))
                         self.event(plan["id"], task["id"], "strategy_changed", next_model)
                         return "progress", 0
-                    fp, _, replanned = self.record_failure(run, task, failure, strategy,
+                    # Look up history by the evidence alone: the saved-files note
+                    # names run-specific paths that would split one failure in two.
+                    fp, _, replanned = self.record_failure(run, task, evidence, strategy,
                                                            workspace, count=False)
                     if plan.get("auto_replan", False) and not replanned:
                         self.mark_replan(run, task, fp, strategy)

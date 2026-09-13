@@ -115,13 +115,16 @@ def run_attempt(record_path):
                     else record.get("worker_timeout_seconds", 180))
             argv = runner_command(task["provider"], agent, workspace, hard,
                                   record.get("unknown_quota_retry_seconds", 1800),
-                                  task.get("quota_bucket", "codex"), idle)
-            code, out, err = run_process(argv, workspace,
-                                         record.get("provider_runner_timeout_seconds", 86400))
+                                  task.get("quota_bucket", "codex"), idle,
+                                  task["files"] if idle else ())
             logs = Path(record["log_directory"])
             logs.mkdir(parents=True, exist_ok=True)
-            (logs / (record["attempt_id"] + ".jsonl")).write_text(out)
-            (logs / (record["attempt_id"] + ".stderr")).write_text(err)
+            # Written as output arrives so a running attempt can be followed live.
+            live = (logs / (record["attempt_id"] + ".jsonl"),
+                    logs / (record["attempt_id"] + ".stderr"))
+            code, out, err = run_process(argv, workspace,
+                                         record.get("provider_runner_timeout_seconds", 86400),
+                                         tee=live)
             result = parse(task["provider"], code, out, err)
             payload = {"status": result.status, "response": result.response,
                        "usage": result.usage, "retry_at": result.retry_at,

@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -193,6 +194,43 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.split(), [str(i) for i in range(10)])
 
+    def test_file_activity_keeps_a_silent_process_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.bin"
+            script = ("import time\n"
+                      "for i in range(8):\n"
+                      "    open(%r, 'ab').write(b'x'); time.sleep(0.15)\n" % str(target))
+            signature = lambda: target.stat().st_size if target.exists() else None
+            code, _, err = run_process(["python3", "-c", script], tmp, 30,
+                                       idle_timeout=0.4, activity=signature)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(target.read_bytes(), b"x" * 8)
+
+    def test_output_is_written_to_tee_files_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_log, err_log = Path(tmp) / "out.log", Path(tmp) / "err.log"
+            script = ("import sys, time\n"
+                      "print('first', flush=True)\n"
+                      "time.sleep(1.5)\n"
+                      "print('second', flush=True)\n")
+            proc = subprocess.Popen(
+                ["python3", "-c",
+                 "import sys; sys.path.insert(0, %r)\n"
+                 "from loop.adapters import run_process\n"
+                 "run_process(['python3', '-c', %r], %r, 30, tee=(%r, %r))\n"
+                 % (str(Path(__file__).resolve().parents[1]), script, tmp,
+                    str(out_log), str(err_log))])
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not (
+                        out_log.exists() and "first" in out_log.read_text()):
+                    time.sleep(0.05)
+                self.assertIn("first", out_log.read_text())
+                self.assertNotIn("second", out_log.read_text())
+            finally:
+                proc.wait()
+            self.assertIn("second", out_log.read_text())
+
     def test_noninteractive_processes_receive_eof_not_a_live_stdin_pipe(self):
         proc = MagicMock()
         proc.returncode = 0
@@ -333,6 +371,13 @@ class EngineTests(unittest.TestCase):
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b): return a+b\n")
 
+    def test_plan_rejects_gitignored_task_files(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["files"] = ["__pycache__/answer.py"]
+        with self.assertRaisesRegex(ValueError, "gitignored"):
+            validate_plan(plan, self.repo)
+        validate_plan(self.plan, self.repo)
+
     def test_timeout_keeps_in_scope_progress_and_next_attempt_continues(self):
         calls = 0
         def worker(_task, prompt, workspace):
@@ -352,6 +397,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((row["status"], row["attempts"]), ("pending", 0))
         self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
         self.assertEqual(calls, 2)
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
+
+    def test_failed_check_saves_rejected_files_for_the_next_attempt(self):
+        calls = 0
+        def worker(_task, prompt, workspace):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                (workspace / "answer.py").write_text("def add(a,b): return 0\n")
+                return Result("ok", "done")
+            self.assertFalse((workspace / "answer.py").exists())
+            saved = self.engine.home / "rejected" / "test" / "one" / "answer.py"
+            self.assertEqual(saved.read_text(), "def add(a,b): return 0\n")
+            self.assertIn(str(saved.parent), prompt)
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "done")
+        self.engine.tick(self.plan, worker)
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
         self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
 
     def test_timeout_without_new_progress_is_not_resumed_forever(self):
