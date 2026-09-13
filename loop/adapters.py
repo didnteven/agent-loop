@@ -163,7 +163,9 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "150s"]
+                # agy's own cutoff would end a working turn and report SUCCESS;
+                # the supervisor's idle/hard timeouts decide when to stop instead.
+                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
         if workspace:
             # Without this, agy edits files inside its own project scratch
             # directory and ignores the process working directory entirely, so
@@ -442,6 +444,10 @@ def parse(provider, code, out, err, now=None):
                 success = False
             if event.get("is_error") or event.get("error"):
                 errors.append(str(event.get("error", response)))
+    if provider == "antigravity" and "print timeout" in err.lower() and "in progress" in err.lower():
+        # agy returns SUCCESS with partial output when its own cutoff ends a turn.
+        errors.append("Provider print timeout: turn still in progress was cut off (timed out)")
+        success = False
     waits = [event for event in events if event.get("agent_loop_result") == "provider_wait"]
     if code == 75 and len(waits) == 1:
         wait = waits[0]

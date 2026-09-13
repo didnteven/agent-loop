@@ -179,6 +179,14 @@ class AdapterTests(unittest.TestCase):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
 
+    def test_antigravity_cut_off_turn_is_a_timeout_not_success(self):
+        out = '{"status":"SUCCESS","response":"","usage":{"total_tokens":10}}'
+        err = "[agy] print timeout after 2m30s with turn in progress; returning partial output"
+        result = parse("antigravity", 0, out, err)
+        self.assertEqual(result.status, "transient")
+        self.assertIn("timeout", result.error.lower())
+        self.assertEqual(parse("antigravity", 0, out, "").status, "ok")
+
     def test_idle_timeout_stops_a_silent_process(self):
         code, _, err = run_process(["python3", "-c", "import time; time.sleep(10)"],
                                    tempfile.gettempdir(), 30, idle_timeout=0.3)
