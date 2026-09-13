@@ -120,8 +120,8 @@ def run_attempt(record_path):
             logs = Path(record["log_directory"])
             logs.mkdir(parents=True, exist_ok=True)
             # Written as output arrives so a running attempt can be followed live.
-            live = (logs / (record["attempt_id"] + ".jsonl"),
-                    logs / (record["attempt_id"] + ".stderr"))
+            stem = record["task_id"] + "-" + record["attempt_id"]
+            live = (logs / (stem + ".jsonl"), logs / (stem + ".stderr"))
             code, out, err = run_process(argv, workspace,
                                          record.get("provider_runner_timeout_seconds", 86400),
                                          tee=live)

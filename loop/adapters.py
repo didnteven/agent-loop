@@ -403,6 +403,33 @@ def provider_limits(provider, cwd, timeout=30):
     raise ValueError("Unknown provider: " + provider)
 
 
+CUTOFF_MARKERS = (
+    "print timeout",
+    "returning partial output",
+    "turn in progress",
+    "error_max_turns",
+    "max turns reached",
+    "reached max turns",
+    "turn was interrupted",
+)
+
+
+def provider_cutoff(err, response, events):
+    """The marker text when a provider CLI ended a turn on its own limit.
+
+    Only the CLI's own stderr and event types are inspected, never the model's
+    reply, which may legitimately quote these phrases.
+    """
+    texts = [err or ""]
+    texts += [str(event.get("subtype", "")) + " " + str(event.get("type", "")) for event in events]
+    for text in texts:
+        lowered = text.lower()
+        for marker in CUTOFF_MARKERS:
+            if marker in lowered:
+                return marker
+    return ""
+
+
 def parse(provider, code, out, err, now=None):
     now = time.time() if now is None else now
     events = []
@@ -444,9 +471,11 @@ def parse(provider, code, out, err, now=None):
                 success = False
             if event.get("is_error") or event.get("error"):
                 errors.append(str(event.get("error", response)))
-    if provider == "antigravity" and "print timeout" in err.lower() and "in progress" in err.lower():
-        # agy returns SUCCESS with partial output when its own cutoff ends a turn.
-        errors.append("Provider print timeout: turn still in progress was cut off (timed out)")
+    cutoff = provider_cutoff(err, response, events)
+    if cutoff:
+        # A CLI's own time/turn limit can end a working turn yet still report
+        # success; treat it as a timeout so partial work is continued.
+        errors.append("Provider cut off a turn in progress (timed out): " + cutoff)
         success = False
     waits = [event for event in events if event.get("agent_loop_result") == "provider_wait"]
     if code == 75 and len(waits) == 1:

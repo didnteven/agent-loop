@@ -18,6 +18,10 @@ def canonical_policy(plan, repo):
     trusted_checks = supplied.get("trusted_checks")
     if trusted_checks is None:
         trusted_checks = [task.get("check") for task in plan.get("tasks", [])]
+    trusted_commands = supplied.get("trusted_commands")
+    if trusted_commands is None:
+        trusted_commands = [task["run"] for task in plan.get("tasks", [])
+                            if task.get("provider") == "command" and "run" in task]
     models = supplied.get("models", [])
     result = {
         "allowed_roots": roots,
@@ -31,6 +35,10 @@ def canonical_policy(plan, repo):
         # Omitted limits mean monitoring mode, never an invented default cap.
         "limits": normalize_limits(supplied.get("limits")),
     }
+    if trusted_commands:
+        # Only present when used, so plans without command tasks keep the
+        # policy digest their existing runs were frozen with.
+        result["trusted_commands"] = trusted_commands
     _validate_shape(result, Path(repo).resolve())
     return result
 
@@ -68,6 +76,11 @@ def _validate_shape(policy, repo):
             not isinstance(check, list) or not check or not all(isinstance(arg, str) for arg in check)
             for check in policy["trusted_checks"]):
         raise ValueError("policy.trusted_checks must contain argv lists")
+    commands = policy.get("trusted_commands", [])
+    if not isinstance(commands, list) or any(
+            not isinstance(item, list) or not item or not all(isinstance(arg, str) for arg in item)
+            for item in commands):
+        raise ValueError("policy.trusted_commands must contain argv lists")
     recipes = policy["setup_recipes"]
     if not isinstance(recipes, list):
         raise ValueError("policy.setup_recipes must be a list")
@@ -108,6 +121,11 @@ def validate_against_policy(plan, policy):
             raise ValueError("Task file is outside allowed roots or protected")
         if json.dumps(task["check"], separators=(",", ":")) not in trusted:
             raise ValueError("Task check is not registered by the execution policy")
+        if task.get("provider") == "command":
+            commands = {json.dumps(item, separators=(",", ":"))
+                        for item in policy.get("trusted_commands", [])}
+            if json.dumps(task.get("run"), separators=(",", ":")) not in commands:
+                raise ValueError("Task command is not registered by the execution policy")
 
 
 def recipe_id(recipe):
@@ -136,6 +154,9 @@ def policy_narrows(candidate, authority):
     if not set(candidate["protected_paths"]) >= set(authority["protected_paths"]):
         return False
     if not set(map(tuple, candidate["trusted_checks"])) <= set(map(tuple, authority["trusted_checks"])):
+        return False
+    if not (set(map(tuple, candidate.get("trusted_commands", [])))
+            <= set(map(tuple, authority.get("trusted_commands", [])))):
         return False
     if any(not any(aroot == "." or root == aroot or root.startswith(aroot.rstrip("/") + "/")
                    for aroot in authority["allowed_roots"])

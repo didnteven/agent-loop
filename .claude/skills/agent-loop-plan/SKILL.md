@@ -66,7 +66,7 @@ A worker stopped by either timeout is not treated as a failed repair: its edits 
 ```json
 {
   "id": "short-lowercase-slug",
-  "provider": "codex | claude | antigravity",
+  "provider": "codex | claude | antigravity | command",
   "model": "provider-specific model id",
   "files": ["relative/path/one.py"],
   "prompt": "Implementation instructions for exactly these files.",
@@ -75,7 +75,7 @@ A worker stopped by either timeout is not treated as a failed repair: its edits 
 ```
 
 - `id`: unique within the plan, same slug pattern as plan `id`.
-- `provider`: must be exactly one of `codex`, `claude`, `antigravity` — no other values are accepted.
+- `provider`: exactly one of `codex`, `claude`, `antigravity`, or `command` (a trusted host command given as `run`, no model).
 - `files`: non-empty, no duplicates. These are the *only* paths the worker is allowed to write; any other changed/untracked file in the worktree aborts the run with "Unexpected changes in managed worktree." Paths are validated against path traversal (`safe_path`) — no `..`, no absolute paths.
 - `check`: a non-empty **argv list** (not a shell string) run inside the task's worktree with cwd = workspace. It must be committed before the run and must not be one of the worker-writable `files`. On failure, the worker's changes are rolled back and the next attempt receives the check output.
 - `prompt`: task-specific implementation instructions. Workers use normal repository tools and edit the managed worktree directly; delegation and subagents remain disabled. Do not request a JSON/file-bundle response.
@@ -85,6 +85,13 @@ Optional per-task fields:
 - `quota_bucket`: which Codex rate-limit bucket to preflight-check (default `"codex"`), only relevant when `provider` is `codex`.
 - `effort`: `low`, `medium`, or `high` (default `low`). Antigravity model tier suffixes select matching effort automatically; an explicit conflicting value is rejected.
 - `max_file_shrink_fraction`: largest allowed size reduction for an existing file of at least 1000 bytes (default `0.5`). Set `allow_large_deletions: true` only when substantial deletion is explicitly intended.
+- `review`: opt-in model quality gate after the check passes, e.g. `{"provider": "claude", "instructions": "faces visible, phone clear of the subject, caption legible", "attach": ["path/to/reference.png"]}`. Use it whenever the check can only prove existence/size (images, video, copy, UI) — those checks pass on bad output. A decline fails the attempt with the reviewer's reasoning.
+
+Command tasks: `"provider": "command"` plus `"run": ["argv", ...]` runs a trusted host step with no model (simulator/device capture, builds, ffmpeg renders). Use it for anything a headless worker can't do. `files`, `check`, and commit rules are unchanged; `run` must not name the task's own output files, and any script it invokes must be committed. Optional `timeout_seconds` (plan default `command_timeout_seconds`, 3600).
+
+Plan-level additions: `base_ref` (start from an existing branch/commit, e.g. a previous run's `loop/<id>` branch, instead of HEAD), `preflight_checks: "skip"` (mark tasks whose check already passes as done without a model), `command_timeout_seconds`.
+
+Preflight at `run` start rejects checks/commands whose scripts aren't committed at the base and warns about prompt paths missing from the worktree. To change a running plan (budgets, timeouts, new tasks) use `python3 -m loop amend <plan>.json` instead of minting a new id; completed tasks can't change and tasks can't be removed.
 
 ## Failure review
 

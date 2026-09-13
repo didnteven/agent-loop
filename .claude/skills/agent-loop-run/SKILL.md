@@ -22,8 +22,12 @@ python3 -m loop run <plan>.json --once
 Check progress without starting workers:
 
 ```sh
-python3 -m loop status
+python3 -m loop status --run <run-id>          # compact table; plain `status` dumps all JSON
+python3 -m loop logs <run-id> <task-id> -f     # follow the live attempt output
+python3 -m loop supervisors                    # which supervisors are running (pid)
 ```
+
+Stop a supervisor with `python3 -m loop stop <run-id>` (progress is kept). To raise a budget, change timeouts, or add tasks to an existing run, stop it, then `python3 -m loop amend <plan>.json [--budget codex=N] [--set key=json]`, then rerun — don't mint a new plan id. To continue from an earlier run's committed work in a new plan, `python3 -m loop run <plan>.json --from-run <earlier-run-id>`. `python3 -m loop clean` (add `--yes`) removes worktrees of superseded/merged runs.
 
 When a task is waiting, leave the Python process running. When it is blocked by authentication or configuration, inspect the recorded error, fix the provider setup, then reset that task and rerun:
 

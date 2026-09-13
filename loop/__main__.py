@@ -20,7 +20,28 @@ def main():
     run.add_argument("--once", action="store_true", help="One scheduler tick; no waiting")
     run.add_argument("--review", action="store_true",
                       help="Self-review the plan before starting; abort if declined")
-    sub.add_parser("status")
+    start = run.add_mutually_exclusive_group()
+    start.add_argument("--base", help="Start a new run from this git ref instead of HEAD")
+    start.add_argument("--from-run", help="Start a new run from another run's branch")
+    status = sub.add_parser("status")
+    status.add_argument("--run", help="Compact table for one run instead of the full JSON state")
+    logs = sub.add_parser("logs", help="Print (or follow) the latest attempt log")
+    logs.add_argument("run_id")
+    logs.add_argument("task_id", nargs="?")
+    logs.add_argument("--follow", "-f", action="store_true")
+    sub.add_parser("supervisors", help="List runs whose supervisor is currently running")
+    stop_parser = sub.add_parser("stop", help="Stop a run's supervisor; progress is kept")
+    stop_parser.add_argument("run_id")
+    amend = sub.add_parser("amend", help="Apply an edited plan to an existing run")
+    amend.add_argument("plan")
+    amend.add_argument("--budget", action="append", default=[], metavar="PROVIDER=TOKENS",
+                       help="Set provider_token_budgets entries (written back to the plan file)")
+    amend.add_argument("--set", action="append", default=[], metavar="KEY=JSON",
+                       help="Set a top-level plan setting, e.g. worker_idle_timeout_seconds=600")
+    clean = sub.add_parser("clean", help="Remove worktrees of superseded/merged runs (dry run by default)")
+    clean.add_argument("--yes", action="store_true", help="Actually remove them")
+    clean.add_argument("--include-unpublished", action="store_true",
+                       help="Also clean finished runs that were never merged")
     sub.add_parser("codex-quota")
     usage = sub.add_parser("usage", help="Read usage/quota telemetry from every provider")
     usage.add_argument("--timeout", type=int, default=30)
@@ -78,7 +99,52 @@ def main():
     engine = Engine(args.repo)
     try:
         if args.command == "status":
-            print(json.dumps(engine.status(), indent=2))
+            if args.run:
+                print(engine.run_summary(args.run))
+            else:
+                print(json.dumps(engine.status(), indent=2))
+        elif args.command == "logs":
+            try:
+                path = engine.latest_log(args.run_id, args.task_id)
+            except ValueError as exc:
+                print(str(exc))
+                return 1
+            print("==> " + str(path), flush=True)
+            if args.task_id and not path.name.startswith(args.task_id + "-"):
+                print("(no logs named for this task; this is the run's latest untagged log)",
+                      flush=True)
+            with path.open(errors="replace") as stream:
+                print(stream.read(), end="", flush=True)
+                while args.follow:
+                    chunk = stream.read()
+                    if chunk:
+                        print(chunk, end="", flush=True)
+                    else:
+                        time.sleep(0.5)
+        elif args.command == "supervisors":
+            print(json.dumps(engine.supervisors(), indent=2))
+        elif args.command == "stop":
+            entry = engine.stop_supervisor(args.run_id)
+            print(json.dumps({"state": "stop_requested", "run": args.run_id, "pid": entry["pid"]}))
+        elif args.command == "amend":
+            path = Path(args.plan)
+            plan = json.loads(path.read_text())
+            for item in args.budget:
+                provider, _, tokens = item.partition("=")
+                plan.setdefault("provider_token_budgets", {})[provider] = int(tokens)
+            for item in args.set:
+                key, _, raw = item.partition("=")
+                if key in ("id", "tasks"):
+                    raise ValueError("Edit tasks in the plan file; --set is for settings")
+                plan[key] = json.loads(raw)
+            with engine.run_lock(plan.get("id", "")):
+                summary = engine.amend(plan)
+            if args.budget or args.set:
+                path.write_text(json.dumps(plan, indent=2) + "\n")
+            print(json.dumps({"state": "amended", "run": plan["id"], **summary}))
+        elif args.command == "clean":
+            report = engine.clean(apply=args.yes, include_unpublished=args.include_unpublished)
+            print(json.dumps({"applied": args.yes, "runs": report}, indent=2))
         elif args.command == "codex-quota":
             print(json.dumps(provider_limits("codex", Path(args.repo)), indent=2))
         elif args.command == "usage":
@@ -170,6 +236,20 @@ def main():
                 engine.set_task(args.run_id, args.task_id, status="pending", attempts=0, retry_at=0)
         else:
             plan = json.loads(Path(args.plan).read_text())
+            if args.from_run:
+                source = engine.db.execute("SELECT branch FROM runs WHERE id=?",
+                                           (args.from_run,)).fetchone()
+                if not source:
+                    raise ValueError("No run named " + args.from_run)
+                args.base = source["branch"]
+            if args.base:
+                if plan.get("base_ref", args.base) != args.base:
+                    raise ValueError("Plan base_ref conflicts with --base/--from-run")
+                plan["base_ref"] = args.base
+            stored = engine.db.execute("SELECT plan FROM runs WHERE id=?", (plan.get("id"),)).fetchone()
+            if stored and "base_ref" not in plan and "base_ref" in json.loads(stored["plan"]):
+                # Resuming needs no flags: the run remembers where it started.
+                plan["base_ref"] = json.loads(stored["plan"])["base_ref"]
             with engine.run_lock(plan.get("id", "")):
                 if args.review and not engine.db.execute(
                         "SELECT 1 FROM runs WHERE id=?", (plan.get("id"),)).fetchone():

@@ -64,6 +64,28 @@ Claude Code quota telemetry is collected by the project status line into `.agent
 
 `usage` reads live telemetry from all three providers before you commit to a plan: Codex's app-server, Claude's `/usage` command, and the local `antigravity-usage` utility. Install the latter once and set `AGENT_LOOP_ANTIGRAVITY_USAGE_DIR` if it is not at `/tmp/antigravity-usage`; missing telemetry is reported explicitly rather than treated as available quota.
 
+## Operating a run
+
+```sh
+python3 -m loop status --run <run-id>              # compact task table (plain `status` is full JSON)
+python3 -m loop logs <run-id> [task-id] --follow   # live output of the latest attempt
+python3 -m loop supervisors                        # runs whose supervisor is running, with pid
+python3 -m loop stop <run-id>                      # SIGTERM; progress is kept
+python3 -m loop amend <plan>.json --budget codex=800000 --set worker_idle_timeout_seconds=900
+python3 -m loop run <plan>.json --from-run <earlier-run-id>   # or --base <git-ref>
+python3 -m loop clean [--yes] [--include-unpublished]
+```
+
+- `amend` applies an edited plan to an existing run (stop its supervisor first). Completed tasks are frozen and tasks can't be removed; settings, budgets, pending tasks and new tasks can change, and tasks parked on a token budget are released. `--budget`/`--set` are written back to the plan file so the next `run` matches.
+- `--base`/`--from-run` (or a plan's `base_ref`) start a new run from existing work instead of whatever is checked out; resuming later needs no flag.
+- `clean` removes worktrees and saved rejected files for superseded or merged runs (branches are kept). It is a dry run without `--yes`; finished-but-unmerged runs need `--include-unpublished`, because `publish` uses their worktree.
+
+Before a new run starts, preflight rejects checks or commands whose script files aren't committed at the base, and warns when a prompt names a path that won't exist in the worktree (gitignored inputs need absolute paths). The first time a task is attempted, a check that already passes is reported as unable to verify the task; set `"preflight_checks": "skip"` to mark such tasks done without a model call.
+
+A task with `"provider": "command"` and a `"run"` argv executes a trusted host command (a simulator capture, a build, a render) instead of a model: no quota, tokens or prompt, but the same file allowlist, trusted check and commit. Commands are registered by policy like checks, live output goes to the run's logs, and failures retry with backoff until unchanged repeats park the task.
+
+A task's optional `review` (`{"provider": "claude", "model": ..., "instructions": "...", "attach": [...]}`) adds a model quality gate after the trusted check passes and before commit. The reviewer sees the task, the text diff and the absolute paths of changed media (images, video) to open; a decline or an unavailable reviewer fails the attempt with its reasoning, and a reviewer that edits the worktree voids its verdict. It costs one review call per attempt, so it is opt-in.
+
 ## Two-pass planning
 
 Use `plan` to check all provider quotas first, have a budget model scout the repository, and have a stronger model turn those notes into a validated plan:
