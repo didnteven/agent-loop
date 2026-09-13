@@ -17,6 +17,7 @@ broken by a stray sentence, code fence, or tool-use attempt in the reply.
 """
 import json
 import re
+from pathlib import Path
 
 from .adapters import command, parse, run_process
 from .engine import git
@@ -82,6 +83,55 @@ def review_pr(provider, model, plan, workspace, base_sha, timeout=180, engine=No
               + "\n\nDIFF:\n" + diff[:20000])
     return _ask(provider, model, prompt, workspace, timeout, engine,
                 plan.get("id", "review"), "release")
+
+
+OUTPUT_REVIEW_PROMPT = (
+    "You are the quality gate for one finished task. Its trusted check already passed, which only "
+    "proves narrow assertions (for example that a file exists at a size). Judge whether the output "
+    "actually achieves the task's goal at a quality its author would ship. You may open and read "
+    "files, including images and video frames, with your read tools, but you must not edit, "
+    "create, or delete anything, run builds, commit, or ask questions. Be specific about any "
+    "defect so a retry can fix it. End your reply with exactly one line, alone, in this exact "
+    "form: \"REVIEW: APPROVED\" or \"REVIEW: DECLINED\".\n\n"
+)
+MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".pdf")
+
+
+def review_output(provider, model, task, workspace, timeout=600, engine=None, run_id="review"):
+    """Opt-in post-check review of a task's uncommitted output."""
+    workspace = Path(workspace)
+    spec = task.get("review", {})
+    diff = git(workspace, "diff", "HEAD", "--", *task["files"])
+    untracked = git(workspace, "ls-files", "--others", "--exclude-standard", "--", *task["files"])
+    for name in untracked.splitlines():
+        path = workspace / name
+        if path.suffix.lower() not in MEDIA_SUFFIXES and path.is_file():
+            diff += "\n--- new file " + name + "\n" + path.read_text(errors="replace")[:6000]
+    media = [str(workspace / name) for name in task["files"]
+             if name.lower().endswith(MEDIA_SUFFIXES) and (workspace / name).is_file()]
+    media += [str(workspace / name) for name in spec.get("attach", [])
+              if (workspace / name).is_file()]
+    prompt = (OUTPUT_REVIEW_PROMPT + "TASK:\n" + json.dumps(
+        {key: task.get(key) for key in ("id", "files", "prompt")}, indent=2))
+    if spec.get("instructions"):
+        prompt += "\n\nREVIEW CRITERIA:\n" + spec["instructions"]
+    if media:
+        prompt += ("\n\nOPEN AND INSPECT THESE FILES (absolute paths):\n"
+                   + "\n".join("- " + path for path in media))
+    prompt += "\n\nUNCOMMITTED TEXT CHANGES:\n" + (diff[:20000] or "(none)")
+    invocation_id = (engine.begin_invocation(run_id, task["id"], 1, "review",
+                                             provider, model, "low") if engine else None)
+    code, out, err = run_process(command(provider, prompt, model, worker=False), workspace, timeout)
+    result = parse(provider, code, out, err)
+    if invocation_id:
+        engine.finish_invocation(invocation_id, result)
+    if result.status != "ok":
+        raise RuntimeError("Output review call failed: " + (result.error or result.response or err)[-2000:])
+    text = result.response.strip()
+    matches = SENTINEL.findall(text)
+    if len(matches) != 1:
+        raise RuntimeError("Output review did not end with exactly one REVIEW verdict: " + text[:500])
+    return {"approved": matches[0] == "APPROVED", "reasoning": SENTINEL.sub("", text).strip()}
 
 
 FAILURE_REVIEW_INSTRUCTIONS = (

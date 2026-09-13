@@ -62,9 +62,8 @@ def build_prompt(record):
                  "You may modify only these paths: " + json.dumps(task["files"]) + ". "
                  "Do not commit or change branches.\n" + task["prompt"])]
     if record.get("previous_error"):
-        sections.append(("previous failure",
-                         "\nPrevious attempt failed this trusted check; fix the issue:\n"
-                         + record["previous_error"][-4000:]))
+        from .engine import previous_attempt_note
+        sections.append(("previous failure", previous_attempt_note(record["previous_error"])))
     if record.get("journal"):
         sections.append(("journal", "\nJOURNAL\n" + record["journal"]))
     for name in task.get("context_files", []):
@@ -111,16 +110,21 @@ def run_attempt(record_path):
             agent = command(task["provider"], build_prompt(record), task.get("model"),
                             task.get("effort"), sandbox=record.get("sandbox", False),
                             workspace=workspace)
-            argv = runner_command(task["provider"], agent, workspace,
-                                  record.get("worker_timeout_seconds", 180),
+            idle = record.get("worker_idle_timeout_seconds")
+            hard = (record.get("worker_max_seconds", 14400) if idle
+                    else record.get("worker_timeout_seconds", 180))
+            argv = runner_command(task["provider"], agent, workspace, hard,
                                   record.get("unknown_quota_retry_seconds", 1800),
-                                  task.get("quota_bucket", "codex"))
-            code, out, err = run_process(argv, workspace,
-                                         record.get("provider_runner_timeout_seconds", 86400))
+                                  task.get("quota_bucket", "codex"), idle,
+                                  task["files"] if idle else ())
             logs = Path(record["log_directory"])
             logs.mkdir(parents=True, exist_ok=True)
-            (logs / (record["attempt_id"] + ".jsonl")).write_text(out)
-            (logs / (record["attempt_id"] + ".stderr")).write_text(err)
+            # Written as output arrives so a running attempt can be followed live.
+            stem = record["task_id"] + "-" + record["attempt_id"]
+            live = (logs / (stem + ".jsonl"), logs / (stem + ".stderr"))
+            code, out, err = run_process(argv, workspace,
+                                         record.get("provider_runner_timeout_seconds", 86400),
+                                         tee=live)
             result = parse(task["provider"], code, out, err)
             payload = {"status": result.status, "response": result.response,
                        "usage": result.usage, "retry_at": result.retry_at,

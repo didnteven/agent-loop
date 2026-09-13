@@ -22,25 +22,114 @@ class Result:
     invoked: bool = True
 
 
-def run_process(argv, cwd, timeout=180, stdin=None):
-    """Bound the whole process group; never interpolate prompts into a shell."""
+def _stop_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None, activity=None,
+                tee=None):
+    """Bound the whole process group; never interpolate prompts into a shell.
+
+    With ``idle_timeout``, a process that keeps producing output is left running
+    until the hard ``timeout``; it is stopped only after ``idle_timeout`` seconds
+    with no stdout/stderr and, when ``activity`` is given, no change in the value
+    it returns (e.g. file modification times). ``tee`` is an optional
+    ``(stdout_path, stderr_path)`` pair appended to as output arrives.
+    """
+    if idle_timeout is None and tee is None:
+        proc = subprocess.Popen(argv, cwd=cwd,
+                                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            out, err = proc.communicate(stdin, timeout=timeout)
+            return proc.returncode, out, err
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                out, err = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                out, err = proc.communicate()
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            return 124, out, err + "\nworker timeout"
+
     proc = subprocess.Popen(argv, cwd=cwd,
                             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
-    try:
-        out, err = proc.communicate(stdin, timeout=timeout)
-        return proc.returncode, out, err
-    except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
-        os.killpg(proc.pid, signal.SIGTERM)
+                            start_new_session=True)
+    if stdin is not None:
         try:
-            out, err = proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            out, err = proc.communicate()
-        if isinstance(exc, KeyboardInterrupt):
-            raise
-        return 124, out, err + "\nworker timeout"
+            proc.stdin.write(stdin.encode())
+        except BrokenPipeError:
+            pass
+        proc.stdin.close()
+    idle_timeout = float("inf") if idle_timeout is None else idle_timeout
+    chunks = {proc.stdout: [], proc.stderr: []}
+    sinks = {}
+    if tee:
+        sinks = {proc.stdout: open(tee[0], "ab"), proc.stderr: open(tee[1], "ab")}
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    sel.register(proc.stderr, selectors.EVENT_READ)
+    start = last_output = time.monotonic()
+    seen = activity() if activity else None
+    reason = ""
+    try:
+        while sel.get_map():
+            now = time.monotonic()
+            if now - start >= timeout:
+                reason = "worker timeout"
+                break
+            if now - last_output >= idle_timeout:
+                current = activity() if activity else None
+                if activity and current != seen:
+                    # Silent but still writing files: that is progress too.
+                    seen, last_output = current, now
+                else:
+                    reason = "worker idle timeout: no output for %ds" % idle_timeout
+                    break
+            wait = min(1.0, timeout - (now - start), idle_timeout - (now - last_output))
+            for key, _ in sel.select(timeout=max(0.0, wait)):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if data:
+                    chunks[key.fileobj].append(data)
+                    if key.fileobj in sinks:
+                        sinks[key.fileobj].write(data)
+                        sinks[key.fileobj].flush()
+                    last_output = time.monotonic()
+                else:
+                    sel.unregister(key.fileobj)
+    except KeyboardInterrupt:
+        _stop_group(proc)
+        raise
+    finally:
+        sel.close()
+        for sink in sinks.values():
+            sink.close()
+    if reason:
+        _stop_group(proc)
+    else:
+        proc.wait()
+    out = b"".join(chunks[proc.stdout]).decode(errors="replace")
+    err = b"".join(chunks[proc.stderr]).decode(errors="replace")
+    proc.stdout.close()
+    proc.stderr.close()
+    if reason:
+        return 124, out, err + "\n" + reason
+    return proc.returncode, out, err
 
 
 def command(provider, prompt, model=None, effort=None, worker=True, sandbox=False,
@@ -74,7 +163,9 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "150s"]
+                # agy's own cutoff would end a working turn and report SUCCESS;
+                # the supervisor's idle/hard timeouts decide when to stop instead.
+                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
         if workspace:
             # Without this, agy edits files inside its own project scratch
             # directory and ignores the process working directory entirely, so
@@ -109,7 +200,7 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
 
 
 def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=1800,
-                   quota_bucket="codex"):
+                   quota_bucket="codex", idle_timeout=None, watch=()):
     """Run one provider through the quota-aware provider boundary.
 
     The engine deliberately does not launch provider CLIs itself.  This small
@@ -118,8 +209,11 @@ def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=180
     """
     runner = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts",
                           "run_provider.py")
+    idle = ["--idle-timeout", str(idle_timeout)] if idle_timeout else []
+    for name in watch:
+        idle += ["--watch", name]
     return [sys.executable, runner, "--repo", str(workspace), "--provider", provider,
-            "--timeout", str(timeout), "--unknown-retry-seconds",
+            "--timeout", str(timeout), *idle, "--unknown-retry-seconds",
             str(unknown_retry_seconds), "--quota-bucket", quota_bucket, "--", *argv]
 
 
@@ -309,6 +403,33 @@ def provider_limits(provider, cwd, timeout=30):
     raise ValueError("Unknown provider: " + provider)
 
 
+CUTOFF_MARKERS = (
+    "print timeout",
+    "returning partial output",
+    "turn in progress",
+    "error_max_turns",
+    "max turns reached",
+    "reached max turns",
+    "turn was interrupted",
+)
+
+
+def provider_cutoff(err, response, events):
+    """The marker text when a provider CLI ended a turn on its own limit.
+
+    Only the CLI's own stderr and event types are inspected, never the model's
+    reply, which may legitimately quote these phrases.
+    """
+    texts = [err or ""]
+    texts += [str(event.get("subtype", "")) + " " + str(event.get("type", "")) for event in events]
+    for text in texts:
+        lowered = text.lower()
+        for marker in CUTOFF_MARKERS:
+            if marker in lowered:
+                return marker
+    return ""
+
+
 def parse(provider, code, out, err, now=None):
     now = time.time() if now is None else now
     events = []
@@ -350,6 +471,12 @@ def parse(provider, code, out, err, now=None):
                 success = False
             if event.get("is_error") or event.get("error"):
                 errors.append(str(event.get("error", response)))
+    cutoff = provider_cutoff(err, response, events)
+    if cutoff:
+        # A CLI's own time/turn limit can end a working turn yet still report
+        # success; treat it as a timeout so partial work is continued.
+        errors.append("Provider cut off a turn in progress (timed out): " + cutoff)
+        success = False
     waits = [event for event in events if event.get("agent_loop_result") == "provider_wait"]
     if code == 75 and len(waits) == 1:
         wait = waits[0]

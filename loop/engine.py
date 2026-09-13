@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -91,6 +92,69 @@ def restore_worker_attempt(workspace, head=None):
         restore_task_files(workspace, names)
 
 
+CONTINUE_PREFIX = "[continue:"
+
+
+def continuation_marker(error):
+    error = error or ""
+    if not error.startswith(CONTINUE_PREFIX):
+        return ""
+    return error[len(CONTINUE_PREFIX):].split("]", 1)[0]
+
+
+def previous_attempt_note(error):
+    if continuation_marker(error):
+        return ("\nThe previous attempt was stopped before it finished (timeout), not "
+                "rejected. Its in-progress edits to the allowed paths are still in the "
+                "worktree. Inspect them and continue from where it left off; do not "
+                "redo work that is already present and correct.\n" + error[-4000:])
+    return "\nPrevious attempt failed this trusted check; fix the issue:\n" + error[-4000:]
+
+
+def preserve_task_progress(workspace, head, allowed):
+    """Keep a stopped worker's edits to allowed files; discard everything else.
+
+    Returns a fingerprint of the kept edits, or "" when nothing in scope changed.
+    """
+    if head and git(workspace, "rev-parse", "HEAD") != head:
+        git(workspace, "reset", "--mixed", head)
+    changed = changed_files(workspace)
+    stray = changed - set(allowed)
+    if stray:
+        restore_task_files(workspace, stray)
+    return progress_fingerprint(workspace, changed & set(allowed))
+
+
+REJECTED_NOTE = "\n\nThe rejected attempt's versions of "
+
+
+def save_rejected_files(workspace, allowed, destination):
+    """Copy a rejected attempt's in-scope files outside the worktree before reset."""
+    kept = sorted(changed_files(workspace) & set(allowed))
+    shutil.rmtree(destination, ignore_errors=True)
+    saved = []
+    for name in kept:
+        source = safe_path(workspace, name)
+        if source.is_file():
+            target = Path(destination) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            saved.append(name)
+    return saved
+
+
+def progress_fingerprint(workspace, names):
+    if not names:
+        return ""
+    digest = hashlib.sha256()
+    for name in sorted(names):
+        target = safe_path(workspace, name)
+        digest.update(name.encode() + b"\0")
+        if target.is_file():
+            digest.update(target.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def file_snapshot(workspace, names):
     """Record pre-attempt file sizes.
 
@@ -161,6 +225,55 @@ def fingerprint(text, workspace=None):
     return hashlib.sha256(value[:600].encode()).hexdigest()[:16]
 
 
+PROMPT_PATH = re.compile(r"(?<![\w/.:-])((?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]{1,8})\b")
+
+
+def exists_at(repo, ref, name):
+    return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", ref + ":" + name],
+                          capture_output=True).returncode == 0
+
+
+def argv_paths(argv):
+    """Repository-relative file arguments in a trusted argv (not flags or inline code)."""
+    paths = []
+    for arg in argv[1:]:
+        if (arg.startswith("-") or " " in arg or "://" in arg or arg.startswith("/")
+                or "/" not in arg or ";" in arg or "(" in arg):
+            continue
+        paths.append(arg)
+    return paths
+
+
+def preflight(plan, repo, base):
+    """Problems visible before any work: missing trusted scripts (errors) and
+    prompt paths that won't exist in the worktree (warnings)."""
+    outputs = {name for task in plan["tasks"] for name in task["files"]}
+    errors, warnings = [], []
+    for task in plan["tasks"]:
+        argvs = [task["check"]] + ([task["run"]] if task.get("provider") == "command" else [])
+        for argv in argvs:
+            for name in argv_paths(argv):
+                if name not in outputs and not exists_at(repo, base, name):
+                    errors.append("%s: %s is not committed at the base commit" % (task["id"], name))
+        for name in sorted(set(PROMPT_PATH.findall(task.get("prompt", "")))):
+            if name.startswith("../") or name in outputs or exists_at(repo, base, name):
+                continue
+            warnings.append("%s: prompt mentions %s, which does not exist in the worktree "
+                            "(gitignored or missing inputs must be referenced by absolute path)"
+                            % (task["id"], name))
+    return errors, warnings
+
+
+def ignored_paths(root, names):
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "check-ignore", "--", *names],
+                              capture_output=True, text=True)
+    except OSError:
+        return []
+    # Exit 1 means nothing is ignored; 128 means root is not a repository.
+    return proc.stdout.split() if proc.returncode == 0 else []
+
+
 def validate_plan(plan, root=None):
     root = Path.cwd() if root is None else Path(root).resolve()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", plan["id"]):
@@ -170,12 +283,34 @@ def validate_plan(plan, root=None):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", task["id"]) or task["id"] in ids:
             raise ValueError("Invalid or duplicate task id")
         ids.add(task["id"])
-        if task["provider"] not in ("codex", "claude", "antigravity"):
+        if task["provider"] not in ("codex", "claude", "antigravity", "command"):
             raise ValueError("Unsupported provider")
+        if task["provider"] == "command":
+            argv = task.get("run")
+            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+                raise ValueError("Command task %s needs a run argv list" % task["id"])
+            if any(name in arg for name in task["files"] for arg in argv):
+                raise ValueError("A command task cannot pass its own output files as arguments")
+        review = task.get("review")
+        if review is not None:
+            if (not isinstance(review, dict)
+                    or review.get("provider") not in ("codex", "claude", "antigravity")
+                    or not isinstance(review.get("instructions", ""), str)
+                    or not isinstance(review.get("attach", []), list)):
+                raise ValueError("Task %s review needs a provider and optional instructions/attach"
+                                 % task["id"])
+            for name in review.get("attach", []):
+                safe_path(root, name)
         if not task["files"] or len(set(task["files"])) != len(task["files"]):
             raise ValueError("Each task needs unique allowed files")
         for name in task["files"]:
             safe_path(root, name)
+        ignored = ignored_paths(root, task["files"])
+        if ignored:
+            # A gitignored output can never be committed, so the task could only
+            # ever fail after spending a full attempt.
+            raise ValueError("Task %s lists gitignored files that can never be committed: %s"
+                             % (task["id"], ", ".join(ignored)))
         if not isinstance(task.get("check"), list) or not task["check"]:
             raise ValueError("Every task needs a trusted check argv")
         if any(name in arg for name in task["files"]
@@ -195,6 +330,8 @@ def validate_plan(plan, root=None):
         check_budget(task.get("token_budget"))
     if not ids:
         raise ValueError("Plan needs tasks")
+    if "base_ref" in plan and (not isinstance(plan["base_ref"], str) or not plan["base_ref"].strip()):
+        raise ValueError("base_ref must be a non-empty git ref")
     policy = canonical_policy(plan, root)
     validate_against_policy(plan, policy)
     edges = dependencies(plan)
@@ -231,6 +368,7 @@ class Engine:
     def __init__(self, repo):
         self.repo = Path(repo).resolve()
         self.home = self.repo / ".agent-loop"
+        self.preflighted = set()
         self.ensure_excluded()
         self.home.mkdir(exist_ok=True)
         self.holding_repo_lock = False
@@ -329,7 +467,8 @@ class Engine:
     def lock(self, name="repo", wait=0.0, message="Another supervisor is active for this repository"):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,70}", name):
             raise ValueError("Invalid lock name")
-        with (self.locks / (name + ".lock")).open("w") as handle:
+        # Append mode: opening must not truncate a live owner's identity record.
+        with (self.locks / (name + ".lock")).open("a+") as handle:
             # Non-blocking with a bounded wait: a held lock must never hang a supervisor.
             deadline = time.monotonic() + wait
             while True:
@@ -340,10 +479,57 @@ class Engine:
                     if time.monotonic() >= deadline:
                         raise RuntimeError(message)
                     time.sleep(0.05)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps({"pid": os.getpid(), "started_at": time.time(),
+                                     "argv": sys.argv}))
+            handle.flush()
             try:
                 yield
             finally:
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def supervisors(self):
+        """Runs whose lock is currently held, with the owning process when recorded."""
+        found = []
+        for path in sorted(self.locks.glob("run-*.lock")):
+            with path.open("a+") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                    continue
+                except BlockingIOError:
+                    handle.seek(0)
+                    raw = handle.read()
+            try:
+                owner = json.loads(raw) if raw else {}
+            except ValueError:
+                owner = {}
+            if not owner.get("pid"):
+                # Supervisors started before owners were recorded: ask the OS
+                # which process holds the lock file.
+                try:
+                    holders = subprocess.run(["lsof", "-t", str(path)], capture_output=True,
+                                             text=True, timeout=10).stdout.split()
+                    owner["pid"] = int(holders[0]) if len(holders) == 1 else None
+                except (OSError, subprocess.TimeoutExpired, ValueError):
+                    pass
+            found.append({"run_id": path.stem[len("run-"):], "pid": owner.get("pid"),
+                          "started_at": owner.get("started_at"), "argv": owner.get("argv")})
+        return found
+
+    def stop_supervisor(self, run_id):
+        """Ask a running supervisor to stop; it keeps progress (SIGTERM is handled)."""
+        for entry in self.supervisors():
+            if entry["run_id"] == run_id:
+                if not entry["pid"]:
+                    raise RuntimeError("Supervisor for %s did not record its process id" % run_id)
+                os.kill(entry["pid"], signal.SIGTERM)
+                return entry
+        raise RuntimeError("No running supervisor for " + run_id)
 
     def run_lock(self, run_id):
         """Exclude only supervisors of the same milestone; distinct plans run concurrently."""
@@ -435,8 +621,14 @@ class Engine:
                     # An interrupted branch creation is preserved; choose a new owned branch.
                     if git(self.repo, "branch", "--list", branch):
                         intent = None
+            warnings = []
             if not intent:
-                base = git(self.repo, "rev-parse", "HEAD")
+                base = git(self.repo, "rev-parse", plan.get("base_ref", "HEAD") + "^{commit}")
+                errors, warnings = preflight(plan, self.repo, base)
+                if errors:
+                    raise ValueError("Plan preflight failed:\n" + "\n".join(errors))
+                for warning in warnings:
+                    print("warning: " + warning, file=sys.stderr)
                 name = plan["id"]
                 workspace = self.home / "worktrees" / name
                 branch = "loop/" + name
@@ -463,7 +655,58 @@ class Engine:
                         (plan["id"], task["id"], task["provider"], task.get("model"),
                          task.get("effort", "low")))
             intent_path.unlink()
+            for warning in warnings:
+                self.event(plan["id"], "plan", "preflight_warning", warning)
             return self.db.execute("SELECT * FROM runs WHERE id=?", (plan["id"],)).fetchone()
+
+    def amend(self, plan):
+        """Accept an edited plan for an existing run without starting over.
+
+        Completed tasks are frozen and no task may be removed; everything else
+        (settings, budgets, pending task definitions, new tasks) can change.
+        The caller must hold the run lock, so no supervisor is mid-tick.
+        """
+        existing = self.db.execute("SELECT * FROM runs WHERE id=?", (plan["id"],)).fetchone()
+        if not existing:
+            raise ValueError("No run named " + plan["id"] + "; start it with run instead")
+        validate_plan(plan, self.repo)
+        old = json.loads(existing["plan"])
+        if old.get("base_ref") != plan.get("base_ref"):
+            raise ValueError("base_ref cannot change for an existing run")
+        new_tasks = {task["id"]: task for task in plan["tasks"]}
+        missing = [task["id"] for task in old["tasks"] if task["id"] not in new_tasks]
+        if missing:
+            raise ValueError("Tasks cannot be removed from a run: " + ", ".join(missing))
+        rows = {row["id"]: row for row in self.db.execute(
+            "SELECT * FROM tasks WHERE run_id=?", (plan["id"],))}
+        for task in old["tasks"]:
+            if rows[task["id"]]["status"] == "done" and new_tasks[task["id"]] != task:
+                raise ValueError("Completed task %s cannot be changed" % task["id"])
+        encoded = json.dumps(plan, sort_keys=True)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        policy = canonical_policy(plan, self.repo)
+        added = [task for task in plan["tasks"] if task["id"] not in rows]
+        changed = sorted(key for key in set(old) | set(plan)
+                         if key != "tasks" and old.get(key) != plan.get(key))
+        with self.db:
+            self.db.execute("UPDATE runs SET plan=?,digest=?,policy=?,policy_version=? WHERE id=?",
+                            (encoded, digest, json.dumps(policy, sort_keys=True),
+                             policy_digest(policy), plan["id"]))
+            for task in added:
+                self.db.execute("""INSERT INTO tasks(
+                    run_id,id,selected_provider,selected_model,selected_effort) VALUES (?,?,?,?,?)""",
+                    (plan["id"], task["id"], task["provider"], task.get("model"),
+                     task.get("effort", "low")))
+            # A raised budget is the usual reason to amend; release what it parked.
+            released = [row["id"] for row in rows.values() if row["status"] == "parked"
+                        and "token budget" in (row["park_reason"] or "")]
+            for task_id in released:
+                self.db.execute("""UPDATE tasks SET status='pending',error='',park_reason='',
+                    wake_kind='',retry_at=0 WHERE run_id=? AND id=?""", (plan["id"], task_id))
+        summary = {"settings": changed, "added_tasks": [t["id"] for t in added],
+                   "released": released}
+        self.event(plan["id"], "plan", "amended", summary)
+        return summary
 
     def park(self, run_id, task_id, reason, wake_kind="new_evidence"):
         self.set_task(run_id, task_id, status="parked", error=reason, park_reason=reason,
@@ -839,6 +1082,11 @@ class Engine:
             "context_characters": model_budget(json.loads(run["policy"]), task.get("model"),
                                                plan.get("context_characters")),
             "worker_timeout_seconds": self.worker_timeout(plan, task),
+            # A worker that is still emitting output is making progress; stop it
+            # only after a silent stretch, under a much larger hard cap.
+            "worker_idle_timeout_seconds": plan.get("worker_idle_timeout_seconds",
+                                                    self.worker_timeout(plan, task)),
+            "worker_max_seconds": plan.get("worker_max_seconds", 14400),
             "unknown_quota_retry_seconds": plan.get("unknown_quota_retry_seconds", 1800),
             "provider_runner_timeout_seconds": plan.get("provider_runner_timeout_seconds", 86400),
             "lease_seconds": plan.get("worker_lease_seconds", 86400),
@@ -1188,12 +1436,46 @@ class Engine:
         self.event(plan["id"], task["id"], "superseded", successor["id"])
         return successor
 
+    def review_output(self, plan, task, workspace):
+        """Opt-in quality gate after the trusted check; unavailable means not approved."""
+        from .review import review_output
+        spec = task["review"]
+        try:
+            verdict = review_output(spec["provider"], spec.get("model"), task, workspace,
+                                    spec.get("timeout_seconds", 600), self, plan["id"])
+        except (OSError, RuntimeError, ValueError) as exc:
+            verdict = {"approved": False, "reasoning": "Output review unavailable: " + str(exc)}
+        self.event(plan["id"], task["id"], "output_review",
+                   "approved" if verdict["approved"] else "rejected")
+        return verdict
+
+    def run_command_task(self, plan, run, task, workspace):
+        """Run a trusted host command in place of a model; no provider, no tokens."""
+        logs = self.home / "logs" / run["id"]
+        logs.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        tee = (logs / (task["id"] + "-command-" + stamp + ".log"),
+               logs / (task["id"] + "-command-" + stamp + ".stderr"))
+        self.event(plan["id"], task["id"], "running", "command")
+        code, out, err = run_process(task["run"], workspace,
+                                     task.get("timeout_seconds",
+                                              plan.get("command_timeout_seconds", 3600)),
+                                     tee=tee)
+        if code == 0:
+            return Result("ok", out[-4000:], invoked=False)
+        # Host commands (simulators, builds) fail transiently often enough to retry
+        # with backoff; unchanged repeated failures still park the task.
+        return Result("transient", out[-2000:],
+                      error=("Command exited %d:\n" % code) + (out + err)[-4000:], invoked=False)
+
     def review_failure(self, plan, task, workspace, failure):
         """Ask one advisory checker only when a plan opts into failure review."""
         if not plan.get("failure_review", False):
             return None
         from .review import review_failure
         provider = plan.get("failure_review_provider", task["provider"])
+        if provider == "command":
+            return None
         try:
             verdict = review_failure(provider, plan.get("failure_review_model"), task, failure,
                                      workspace, plan.get("failure_review_timeout_seconds", 180),
@@ -1262,16 +1544,42 @@ class Engine:
                 continue
             # A failed check or interrupted process must never become the next
             # attempt's starting point. Managed worktrees are supervisor-owned.
-            if changed and carried is None:
+            # The one exception is progress preserved from a timed-out attempt,
+            # kept only while the worktree still matches its recorded fingerprint.
+            marker_fp = continuation_marker(row["error"])
+            resumable = (row["status"] == "pending" and marker_fp
+                         and progress_fingerprint(workspace, changed) == marker_fp)
+            if changed and carried is None and not resumable:
                 restore_task_files(workspace, task["files"])
             if row["status"] == "running" and carried is None:
                 self.set_task(plan["id"], task["id"], status="pending",
                               error="Recovered an interrupted worker attempt")
                 row = self.db.execute("SELECT * FROM tasks WHERE run_id=? AND id=?",
                                       (plan["id"], task["id"])).fetchone()
+            is_command = task["provider"] == "command"
             if carried is None:
-                provider = self.db.execute("SELECT * FROM providers WHERE name=?", (task["provider"],)).fetchone()
-                retry_at = max(row["retry_at"], provider["retry_at"])
+                key = (plan["id"], task["id"])
+                if (row["attempts"] == 0 and not row["error"] and not changed
+                        and key not in self.preflighted):
+                    self.preflighted.add(key)
+                    code, _, _ = run_process(task["check"], workspace,
+                                             plan.get("check_timeout_seconds", 30))
+                    if code == 0:
+                        # A check that already passes cannot tell this task's work
+                        # apart from no work at all.
+                        warning = ("check passes before any work; it may not verify task "
+                                   + task["id"])
+                        print("warning: " + warning, file=sys.stderr)
+                        self.event(plan["id"], task["id"], "check_passes_before_work", task["check"])
+                        if plan.get("preflight_checks") == "skip":
+                            self.set_task(plan["id"], task["id"], status="done",
+                                          sha=git(workspace, "rev-parse", "HEAD"), error="")
+                            self.event(plan["id"], task["id"], "already_satisfied", "preflight")
+                            continue
+                provider = (None if is_command else
+                            self.db.execute("SELECT * FROM providers WHERE name=?",
+                                            (task["provider"],)).fetchone())
+                retry_at = max(row["retry_at"], provider["retry_at"] if provider else 0)
                 if retry_at > now:
                     # A long wait is not free: finishing on another configured
                     # provider beats idling. The task keeps its id, attempts,
@@ -1279,7 +1587,7 @@ class Engine:
                     # attempt's provider changes, so this continues the work
                     # rather than restarting it.
                     threshold = plan.get("failover_after_seconds", 3600)
-                    if retry_at - now >= threshold:
+                    if retry_at - now >= threshold and not is_command:
                         choice, reason = self.failover_model(run, plan, task, now)
                         if choice:
                             self.set_task(plan["id"], task["id"],
@@ -1308,7 +1616,7 @@ class Engine:
                     else:
                         deadlines.append(retry_at)
                         continue
-                budget = plan.get("provider_token_budgets", {}).get(task["provider"])
+                budget = None if is_command else plan.get("provider_token_budgets", {}).get(task["provider"])
                 if budget is not None and self.run_tokens(plan, task["provider"]) >= budget:
                     self.park(plan["id"], task["id"], "Local admission token budget reached for provider " + task["provider"], "policy")
                     continue
@@ -1327,38 +1635,38 @@ class Engine:
                              "You may modify only these paths: " + json.dumps(task["files"]) + ". "
                              "Do not commit or change branches.\n" + task["prompt"])]
                 if row["error"]:
-                    sections.append(("previous failure",
-                                     "\nPrevious attempt failed this trusted check; fix the issue:\n"
-                                     + row["error"][-4000:]))
+                    sections.append(("previous failure", previous_attempt_note(row["error"])))
                 for name in task.get("context_files", []):
                     sections.append(("context " + name, "\nCONTEXT " + name + "\n"
                                      + safe_path(workspace, name).read_text()))
                 budget = model_budget(json.loads(run["policy"]), task.get("model"),
                                       plan.get("context_characters"))
                 prompt = fit(sections, budget)
-                routed = self.route_task(run, plan, task, row)
+                routed = None if is_command else self.route_task(run, plan, task, row)
                 if routed:
                     task = dict(task, provider=routed["provider"], model=routed["model"],
                                 effort=routed.get("effort", "low"))
                 # Admission precedes the attempt: a refused invocation never happened,
                 # so it must not consume this task's retry history.
-                try:
-                    invocation_id = self.begin_invocation(
-                        plan["id"], task["id"], row["attempts"] + 1, "implement",
-                        task["provider"], task.get("model"), task.get("effort", "low"),
-                        task.get("quota_bucket", "codex"))
-                except CapWait as wait:
-                    # A rolling limit is a deadline, not a coding failure: the task
-                    # keeps its attempt count and releases the slot.
-                    self.set_task(plan["id"], task["id"], status="waiting",
-                                  retry_at=wait.deadline, error=str(wait))
-                    self.event(plan["id"], task["id"], "limit_waiting", wait.deadline)
-                    deadlines.append(wait.deadline)
-                    continue
-                except CapReached as reached:
-                    self.park(plan["id"], task["id"], str(reached), "policy")
-                    self.event(plan["id"], task["id"], "limit_reached", reached.scope)
-                    continue
+                invocation_id = None
+                if not is_command:
+                    try:
+                        invocation_id = self.begin_invocation(
+                            plan["id"], task["id"], row["attempts"] + 1, "implement",
+                            task["provider"], task.get("model"), task.get("effort", "low"),
+                            task.get("quota_bucket", "codex"))
+                    except CapWait as wait:
+                        # A rolling limit is a deadline, not a coding failure: the task
+                        # keeps its attempt count and releases the slot.
+                        self.set_task(plan["id"], task["id"], status="waiting",
+                                      retry_at=wait.deadline, error=str(wait))
+                        self.event(plan["id"], task["id"], "limit_waiting", wait.deadline)
+                        deadlines.append(wait.deadline)
+                        continue
+                    except CapReached as reached:
+                        self.park(plan["id"], task["id"], str(reached), "policy")
+                        self.event(plan["id"], task["id"], "limit_reached", reached.scope)
+                        continue
                 self.set_task(plan["id"], task["id"], status="running", attempts=row["attempts"]+1, retry_at=0)
                 self.event(plan["id"], task["id"], "running", task["provider"])
                 head = git(workspace, "rev-parse", "HEAD")
@@ -1372,6 +1680,8 @@ class Engine:
             try:
                 if carried is not None:
                     self.retire_attempt(record)
+                elif is_command:
+                    result = self.run_command_task(plan, run, task, workspace)
                 elif worker:
                     result = worker(task, prompt, workspace)
                 else:
@@ -1403,15 +1713,16 @@ class Engine:
             self.finish_invocation(invocation_id, result)
             spent = token_total(task["provider"], result.usage)
             try:
-                health.record_sample(
-                    self.registry.db, provider=task["provider"],
-                    account=account_identity(task["provider"]),
-                    bucket=task.get("quota_bucket", "codex"), model=task.get("model"),
-                    effort=task.get("effort", "low"), task_class=health.task_class(task),
-                    kind="implement", outcome=result.status, tokens=spent or None,
-                    duration=max(0.0, time.time() - now),
-                    censored=result.status == "transient" and "timeout" in (result.error or "").lower(),
-                    now=now)
+                if not is_command:
+                    health.record_sample(
+                        self.registry.db, provider=task["provider"],
+                        account=account_identity(task["provider"]),
+                        bucket=task.get("quota_bucket", "codex"), model=task.get("model"),
+                        effort=task.get("effort", "low"), task_class=health.task_class(task),
+                        kind="implement", outcome=result.status, tokens=spent or None,
+                        duration=max(0.0, time.time() - now),
+                        censored=result.status == "transient" and "timeout" in (result.error or "").lower(),
+                        now=now)
             except sqlite3.Error:
                 self.registry_failed = True
             self.db.execute("UPDATE providers SET tokens=tokens+?,estimated_usd=estimated_usd+? WHERE name=?",
@@ -1431,6 +1742,21 @@ class Engine:
                 self.event(plan["id"], task["id"], "waiting", deadline)
                 deadlines.append(deadline)
                 continue
+            if (result.status == "transient" and "timeout" in (result.error or "").lower()
+                    and carried is None):
+                progress = preserve_task_progress(workspace, head, task["files"])
+                previous = continuation_marker(row["error"])
+                if progress and progress != previous:
+                    # Stopped mid-work, not failed: keep its in-scope edits and
+                    # continue from them. The attempt is not a repair failure, and
+                    # an unchanged fingerprint falls through so a stuck worker ends.
+                    error = (CONTINUE_PREFIX + progress + "]\n"
+                             + (result.error or "")[-2000:])
+                    self.set_task(plan["id"], task["id"], status="pending",
+                                  attempts=row["attempts"], retry_at=0, error=error)
+                    self.event(plan["id"], task["id"], "continuing", progress)
+                    deadlines.append(now)
+                    continue
             if result.status != "ok":
                 restore_worker_attempt(workspace, head)
                 state = "waiting" if result.status == "transient" else "parked"
@@ -1539,6 +1865,17 @@ class Engine:
                 if unexpected:
                     raise ValueError("Trusted check changed unexpected files: "
                                      + ", ".join(sorted(unexpected)))
+                if task.get("review"):
+                    # A passing check proves only its own assertions; an opted-in
+                    # review judges whether the output is actually good.
+                    reviewed = progress_fingerprint(workspace, changed_files(workspace))
+                    verdict = self.review_output(plan, task, workspace)
+                    if (progress_fingerprint(workspace, changed_files(workspace)) != reviewed
+                            or git(workspace, "rev-parse", "HEAD") != head):
+                        raise ValueError("Output review modified the worktree; its verdict is void")
+                    if not verdict["approved"]:
+                        raise ValueError("Output review rejected this attempt: "
+                                         + verdict["reasoning"][-3000:])
                 git(workspace, "add", "--", *task["files"])
                 if git(workspace, "diff", "--cached", "--name-only") == "":
                     raise ValueError("No code change to commit")
@@ -1573,9 +1910,17 @@ class Engine:
                     self.event(plan["id"], task["id"], "needs_setup", failure)
                     return "progress", 0
                 verdict = self.review_failure(plan, task, workspace, failure) if count == 1 else None
+                saved = save_rejected_files(workspace, task["files"],
+                                            self.home / "rejected" / run["id"] / task["id"])
                 restore_worker_attempt(workspace, head)
                 if verdict:
                     failure = "Failure review: " + verdict["reasoning"] + "\nTrusted check: " + failure
+                evidence = failure
+                if saved:
+                    failure += (REJECTED_NOTE + ", ".join(saved)
+                                + " were saved under " + str(self.home / "rejected" / run["id"] / task["id"])
+                                + " (same relative paths). Read them and reuse whatever is "
+                                "correct instead of starting over; the worktree itself was reset.")
                 if count >= 2:
                     policy = json.loads(run["policy"])
                     choices = policy.get("models", [])
@@ -1594,7 +1939,9 @@ class Engine:
                                       selected_effort=next_model.get("effort", "low"))
                         self.event(plan["id"], task["id"], "strategy_changed", next_model)
                         return "progress", 0
-                    fp, _, replanned = self.record_failure(run, task, failure, strategy,
+                    # Look up history by the evidence alone: the saved-files note
+                    # names run-specific paths that would split one failure in two.
+                    fp, _, replanned = self.record_failure(run, task, evidence, strategy,
                                                            workspace, count=False)
                     if plan.get("auto_replan", False) and not replanned:
                         self.mark_replan(run, task, fp, strategy)
@@ -1669,6 +2016,82 @@ class Engine:
                 + decision_body
                 + "\n\nBranch: `" + run["branch"] + "`\n")
         (self.home / (plan["id"]+"-pr.md")).write_text(body)
+
+    def run_summary(self, run_id):
+        """A compact, human-readable view of one run."""
+        run = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise ValueError("No run named " + run_id)
+        rows = self.db.execute("SELECT * FROM tasks WHERE run_id=?", (run_id,)).fetchall()
+        order = {task["id"]: index for index, task in enumerate(json.loads(run["plan"])["tasks"])}
+        rows = sorted(rows, key=lambda row: order.get(row["id"], len(order)))
+        held = {entry["run_id"] for entry in self.supervisors()}
+        lines = ["run %s  branch %s  supervisor %s" % (
+            run_id, run["branch"], "running" if run_id in held else "not running")]
+        width = max([len(row["id"]) for row in rows] + [4])
+        lines.append("%-*s  %-8s  %-11s  %4s  %8s  %s" % (
+            width, "task", "status", "provider", "try", "tokens", "detail"))
+        for row in rows:
+            detail = (row["park_reason"] or row["error"] or row["sha"] or "").strip()
+            detail = detail.splitlines()[0][:90] if detail else ""
+            if row["status"] == "waiting" and row["retry_at"]:
+                detail = "retry %s  %s" % (time.strftime("%H:%M", time.localtime(row["retry_at"])),
+                                           detail)
+            lines.append("%-*s  %-8s  %-11s  %4d  %8d  %s" % (
+                width, row["id"], row["status"], row["selected_provider"] or "",
+                row["attempts"], row["tokens"] or 0, detail))
+        return "\n".join(lines)
+
+    def latest_log(self, run_id, task_id=None):
+        logs = self.home / "logs" / run_id
+        def matching(pattern):
+            return [path for path in logs.glob(pattern)
+                    if path.suffix in (".jsonl", ".log") and path.is_file()]
+        candidates = matching((task_id + "-*") if task_id else "*")
+        if task_id and not candidates:
+            # Logs written before task-prefixed names can't be attributed to a task.
+            candidates = [path for path in matching("*") if "-" not in path.stem]
+        if not candidates:
+            raise ValueError("No logs for %s%s" % (run_id, " / " + task_id if task_id else ""))
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def clean(self, apply=False, include_unpublished=False):
+        """Remove worktrees and saved attempt files for runs that can no longer progress.
+
+        Superseded runs and merged runs qualify; finished-but-unmerged runs only
+        with ``include_unpublished``, because publish needs their worktree.
+        Branches and commits are kept. Dry run unless ``apply``.
+        """
+        held = {entry["run_id"] for entry in self.supervisors()}
+        report = []
+        for run in self.db.execute("SELECT * FROM runs").fetchall():
+            statuses = [row["status"] for row in self.db.execute(
+                "SELECT status FROM tasks WHERE run_id=?", (run["id"],))]
+            finished = bool(statuses) and all(status == "done" for status in statuses)
+            merged = self.db.execute("SELECT 1 FROM events WHERE run_id=? AND kind='merged'",
+                                     (run["id"],)).fetchone()
+            eligible = run["superseded_by"] or (finished and (merged or include_unpublished))
+            if not eligible or run["id"] in held:
+                continue
+            workspace = Path(run["workspace"])
+            targets = [path for path in (workspace, self.home / "rejected" / run["id"])
+                       if path.exists()]
+            if not targets:
+                continue
+            entry = {"run_id": run["id"], "reason": "finished" if finished else "superseded",
+                     "remove": [str(path) for path in targets], "kept_branch": run["branch"]}
+            if apply:
+                if workspace.exists():
+                    if git(workspace, "status", "--porcelain"):
+                        entry["skipped"] = "worktree has uncommitted changes"
+                        report.append(entry)
+                        continue
+                    with self.repo_lock():
+                        git(self.repo, "worktree", "remove", str(workspace))
+                shutil.rmtree(self.home / "rejected" / run["id"], ignore_errors=True)
+                self.event(run["id"], "cleanup", "cleaned", entry["remove"])
+            report.append(entry)
+        return report
 
     def status(self):
         return {table: [dict(r) for r in self.db.execute("SELECT * FROM " + table)]

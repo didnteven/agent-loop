@@ -1,6 +1,8 @@
 import json
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -178,6 +180,95 @@ class AdapterTests(unittest.TestCase):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)
         self.assertEqual(code, 124)
 
+    def test_any_provider_turn_limit_is_a_timeout(self):
+        out = '{"type":"result","subtype":"error_max_turns","is_error":false,"result":"partial"}'
+        result = parse("claude", 0, out, "")
+        self.assertEqual(result.status, "transient")
+        quoted = '{"type":"result","subtype":"success","is_error":false,"result":"notes on print timeout"}'
+        self.assertEqual(parse("claude", 0, quoted, "").status, "ok")
+
+    def test_output_review_lists_media_and_reads_verdict(self):
+        from loop.review import review_output
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            git(workspace, "config", "user.name", "T")
+            git(workspace, "config", "user.email", "t@example.invalid")
+            (workspace / "seed").write_text("x")
+            git(workspace, "add", "seed")
+            git(workspace, "commit", "-qm", "seed")
+            (workspace / "ad.png").write_bytes(b"\x89PNG")
+            task = {"id": "ad", "files": ["ad.png"], "prompt": "make an ad",
+                    "review": {"provider": "claude", "instructions": "faces visible"}}
+            reply = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                "result": "The phone hides the face.\nREVIEW: DECLINED"})
+            with patch("loop.review.run_process", return_value=(0, reply, "")) as run:
+                verdict = review_output("claude", None, task, workspace)
+            prompt = run.call_args.args[0][2]
+            self.assertIn(str(workspace / "ad.png"), prompt)
+            self.assertIn("faces visible", prompt)
+            self.assertEqual(verdict, {"approved": False, "reasoning": "The phone hides the face."})
+
+    def test_antigravity_cut_off_turn_is_a_timeout_not_success(self):
+        out = '{"status":"SUCCESS","response":"","usage":{"total_tokens":10}}'
+        err = "[agy] print timeout after 2m30s with turn in progress; returning partial output"
+        result = parse("antigravity", 0, out, err)
+        self.assertEqual(result.status, "transient")
+        self.assertIn("timeout", result.error.lower())
+        self.assertEqual(parse("antigravity", 0, out, "").status, "ok")
+
+    def test_idle_timeout_stops_a_silent_process(self):
+        code, _, err = run_process(["python3", "-c", "import time; time.sleep(10)"],
+                                   tempfile.gettempdir(), 30, idle_timeout=0.3)
+        self.assertEqual(code, 124)
+        self.assertIn("idle timeout", err)
+
+    def test_idle_timeout_lets_a_process_that_keeps_producing_output_finish(self):
+        script = ("import sys, time\n"
+                  "for i in range(10):\n"
+                  "    print(i, flush=True); time.sleep(0.1)\n")
+        code, out, _ = run_process(["python3", "-c", script], tempfile.gettempdir(), 30,
+                                   idle_timeout=0.5)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), [str(i) for i in range(10)])
+
+    def test_file_activity_keeps_a_silent_process_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.bin"
+            script = ("import time\n"
+                      "for i in range(8):\n"
+                      "    open(%r, 'ab').write(b'x'); time.sleep(0.15)\n" % str(target))
+            signature = lambda: target.stat().st_size if target.exists() else None
+            code, _, err = run_process(["python3", "-c", script], tmp, 30,
+                                       idle_timeout=0.4, activity=signature)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(target.read_bytes(), b"x" * 8)
+
+    def test_output_is_written_to_tee_files_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_log, err_log = Path(tmp) / "out.log", Path(tmp) / "err.log"
+            script = ("import sys, time\n"
+                      "print('first', flush=True)\n"
+                      "time.sleep(1.5)\n"
+                      "print('second', flush=True)\n")
+            proc = subprocess.Popen(
+                ["python3", "-c",
+                 "import sys; sys.path.insert(0, %r)\n"
+                 "from loop.adapters import run_process\n"
+                 "run_process(['python3', '-c', %r], %r, 30, tee=(%r, %r))\n"
+                 % (str(Path(__file__).resolve().parents[1]), script, tmp,
+                    str(out_log), str(err_log))])
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not (
+                        out_log.exists() and "first" in out_log.read_text()):
+                    time.sleep(0.05)
+                self.assertIn("first", out_log.read_text())
+                self.assertNotIn("second", out_log.read_text())
+            finally:
+                proc.wait()
+            self.assertIn("second", out_log.read_text())
+
     def test_noninteractive_processes_receive_eof_not_a_live_stdin_pipe(self):
         proc = MagicMock()
         proc.returncode = 0
@@ -317,6 +408,223 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.tick(self.plan, tool_worker)[0], "progress")
         workspace = self.engine.home / "worktrees" / "test"
         self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b): return a+b\n")
+
+    def test_plan_rejects_gitignored_task_files(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["files"] = ["__pycache__/answer.py"]
+        with self.assertRaisesRegex(ValueError, "gitignored"):
+            validate_plan(plan, self.repo)
+        validate_plan(self.plan, self.repo)
+
+    def test_timeout_keeps_in_scope_progress_and_next_attempt_continues(self):
+        calls = 0
+        def worker(_task, prompt, workspace):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                (workspace / "answer.py").write_text("def add(a,b):\n    pass\n")
+                (workspace / "stray.txt").write_text("outside the allowlist")
+                return Result("transient", error="worker idle timeout: no output for 300s")
+            self.assertEqual((workspace / "answer.py").read_text(), "def add(a,b):\n    pass\n")
+            self.assertFalse((workspace / "stray.txt").exists())
+            self.assertIn("continue from where it left off", prompt)
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "finished")
+        self.engine.tick(self.plan, worker)
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual((row["status"], row["attempts"]), ("pending", 0))
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
+
+    def test_failed_check_saves_rejected_files_for_the_next_attempt(self):
+        calls = 0
+        def worker(_task, prompt, workspace):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                (workspace / "answer.py").write_text("def add(a,b): return 0\n")
+                return Result("ok", "done")
+            self.assertFalse((workspace / "answer.py").exists())
+            saved = self.engine.home / "rejected" / "test" / "one" / "answer.py"
+            self.assertEqual(saved.read_text(), "def add(a,b): return 0\n")
+            self.assertIn(str(saved.parent), prompt)
+            (workspace / "answer.py").write_text("def add(a,b): return a+b\n")
+            return Result("ok", "done")
+        self.engine.tick(self.plan, worker)
+        self.assertEqual(self.engine.tick(self.plan, worker)[0], "progress")
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
+
+    def test_timeout_without_new_progress_is_not_resumed_forever(self):
+        def stuck(_task, _prompt, workspace):
+            (workspace / "answer.py").write_text("def add(a,b):\n    pass\n")
+            return Result("transient", error="worker timeout")
+        workspace = self.engine.home / "worktrees" / "test"
+        self.engine.tick(self.plan, stuck)
+        self.assertTrue((workspace / "answer.py").exists())
+        self.engine.tick(self.plan, stuck)
+        self.assertFalse((workspace / "answer.py").exists())
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "waiting")
+
+    def commit_file(self, name, content):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        git(self.repo, "add", name)
+        git(self.repo, "commit", "-qm", "add " + name)
+
+    def test_command_task_runs_without_a_model(self):
+        self.commit_file("tools/gen.py", "open('answer.py','w').write('def add(a,b): return a+b\\n')\n")
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0].update(provider="command", run=["python3", "tools/gen.py"])
+        self.assertEqual(self.engine.tick(plan, self.good_worker)[0], "progress")
+        self.assertEqual(self.calls, 0)
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual((row["status"], row["tokens"]), ("done", 0))
+        self.assertTrue(list((self.engine.home / "logs" / "test").glob("one-command-*.log")))
+
+    def test_failing_command_task_retries_with_backoff(self):
+        self.commit_file("tools/fail.py", "raise SystemExit(3)\n")
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0].update(provider="command", run=["python3", "tools/fail.py"])
+        self.engine.tick(plan)
+        row = self.engine.status()["tasks"][0]
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("Command exited 3", row["error"])
+
+    def test_command_must_be_registered_by_policy(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0].update(provider="command", run=["python3", "tools/gen.py"])
+        plan["policy"] = {"trusted_commands": [["python3", "other.py"]]}
+        with self.assertRaisesRegex(ValueError, "command is not registered"):
+            validate_plan(plan, self.repo)
+
+    def test_output_review_rejection_blocks_commit_and_retries(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["review"] = {"provider": "claude", "instructions": "must be tidy"}
+        verdicts = [{"approved": False, "reasoning": "Phone covers the athlete's face"},
+                    {"approved": True, "reasoning": ""}]
+        with patch.object(Engine, "review_output", side_effect=lambda *_: verdicts.pop(0)):
+            self.assertEqual(self.engine.tick(plan, self.good_worker)[0], "progress")
+            row = self.engine.status()["tasks"][0]
+            self.assertEqual(row["status"], "pending")
+            self.assertIn("Output review rejected", row["error"])
+            self.assertIn("covers the athlete", row["error"])
+            workspace = self.engine.home / "worktrees" / "test"
+            self.assertEqual(git(workspace, "rev-list", "--count", "HEAD"), "1")
+            self.assertEqual(self.engine.tick(plan, self.good_worker)[0], "progress")
+        self.assertEqual(self.engine.status()["tasks"][0]["status"], "done")
+
+    def test_review_that_edits_the_worktree_is_void(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["review"] = {"provider": "claude"}
+        workspace = self.engine.home / "worktrees" / "test"
+        def meddling(*_):
+            (workspace / "answer.py").write_text("def add(a,b): return a+b  # edited\n")
+            return {"approved": True, "reasoning": ""}
+        with patch.object(Engine, "review_output", side_effect=meddling):
+            self.engine.tick(plan, self.good_worker)
+        self.assertIn("modified the worktree", self.engine.status()["tasks"][0]["error"])
+
+    def test_amend_raises_budget_releases_parked_task_and_adds_tasks(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["provider_token_budgets"] = {"codex": 10}
+        with self.engine.run_lock("test"):
+            self.engine.tick(plan, self.good_worker)
+        self.engine.set_task("test", "one", status="pending", sha=None)
+        self.engine.db.execute("UPDATE tasks SET tokens=50 WHERE run_id='test'")
+        self.engine.db.commit()
+        workspace = self.engine.home / "worktrees" / "test"
+        git(workspace, "reset", "-q", "--hard", "HEAD~1")
+        self.engine.tick(plan, self.good_worker)
+        self.assertIn("token budget", self.engine.status()["tasks"][0]["park_reason"])
+        amended = json.loads(json.dumps(plan))
+        amended["provider_token_budgets"] = {"codex": 100000}
+        amended["tasks"].append({"id": "two", "provider": "codex", "files": ["other.py"],
+                                 "prompt": "write other", "check": ["python3", "-c", "import other"]})
+        summary = self.engine.amend(amended)
+        self.assertEqual(summary["released"], ["one"])
+        self.assertEqual(summary["added_tasks"], ["two"])
+        self.assertEqual(summary["settings"], ["provider_token_budgets"])
+        statuses = {row["id"]: row["status"] for row in self.engine.status()["tasks"]}
+        self.assertEqual(statuses, {"one": "pending", "two": "pending"})
+        self.engine.tick(amended, self.good_worker)
+
+    def test_amend_refuses_to_change_done_tasks_or_remove_tasks(self):
+        self.engine.tick(self.plan, self.good_worker)
+        changed = json.loads(json.dumps(self.plan))
+        changed["tasks"][0]["prompt"] = "something else"
+        with self.assertRaisesRegex(ValueError, "Completed task one cannot be changed"):
+            self.engine.amend(changed)
+        extended = json.loads(json.dumps(self.plan))
+        extended["tasks"].append({"id": "two", "provider": "codex", "files": ["b.py"],
+                                  "prompt": "b", "check": ["python3", "-c", "import b"]})
+        self.engine.amend(extended)
+        with self.assertRaisesRegex(ValueError, "cannot be removed"):
+            self.engine.amend(self.plan)
+
+    def test_base_ref_starts_the_run_from_another_branch(self):
+        git(self.repo, "checkout", "-q", "-b", "prior-work")
+        self.commit_file("prior.txt", "earlier run output\n")
+        prior = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "checkout", "-q", "main")
+        plan = dict(json.loads(json.dumps(self.plan)), base_ref="prior-work")
+        self.engine.tick(plan, self.good_worker)
+        run = self.engine.status()["runs"][0]
+        self.assertEqual(run["base"], prior)
+        self.assertTrue((Path(run["workspace"]) / "prior.txt").exists())
+
+    def test_preflight_rejects_uncommitted_check_scripts(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["check"] = ["python3", "checks/verify_sum.py"]
+        with self.assertRaisesRegex(ValueError, "checks/verify_sum.py is not committed"):
+            self.engine.initialize(plan)
+
+    def test_preflight_warns_about_prompt_paths_missing_from_the_worktree(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["prompt"] = "Copy Metadata/en/home.png into place, then write answer.py"
+        self.engine.initialize(plan)
+        details = [row["detail"] for row in self.engine.db.execute(
+            "SELECT detail FROM events WHERE kind='preflight_warning'")]
+        self.assertEqual(len(details), 1)
+        self.assertIn("Metadata/en/home.png", details[0])
+
+    def test_check_that_passes_before_work_can_skip_the_model(self):
+        plan = json.loads(json.dumps(self.plan))
+        plan["tasks"][0]["check"] = ["python3", "-c", "pass"]
+        plan["preflight_checks"] = "skip"
+        self.assertEqual(self.engine.tick(plan, self.good_worker)[0], "ready_for_pr")
+        self.assertEqual(self.calls, 0)
+        kinds = [row["kind"] for row in self.engine.db.execute("SELECT kind FROM events")]
+        self.assertIn("check_passes_before_work", kinds)
+
+    def test_run_summary_logs_and_supervisors(self):
+        self.engine.tick(self.plan, self.good_worker)
+        with self.engine.run_lock("test"):
+            running = self.engine.supervisors()
+            self.assertEqual([(e["run_id"], e["pid"]) for e in running], [("test", os.getpid())])
+            self.assertIn("supervisor running", self.engine.run_summary("test"))
+        self.assertEqual(self.engine.supervisors(), [])
+        summary = self.engine.run_summary("test")
+        self.assertIn("not running", summary)
+        self.assertRegex(summary, r"one\s+done\s+codex")
+        logs = self.engine.home / "logs" / "test"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "one-abc.jsonl").write_text("{}\n")
+        self.assertEqual(self.engine.latest_log("test", "one").name, "one-abc.jsonl")
+
+    def test_clean_removes_only_merged_or_superseded_worktrees(self):
+        self.engine.tick(self.plan, self.good_worker)
+        workspace = self.engine.home / "worktrees" / "test"
+        self.assertEqual(self.engine.clean(apply=True), [])
+        self.assertTrue(workspace.exists())
+        self.engine.event("test", "release", "merged", {})
+        report = self.engine.clean()
+        self.assertEqual([entry["run_id"] for entry in report], ["test"])
+        self.assertTrue(workspace.exists())
+        self.engine.clean(apply=True)
+        self.assertFalse(workspace.exists())
+        self.assertTrue(git(self.repo, "branch", "--list", "loop/test"))
 
     def test_failed_check_rolls_back_before_retry(self):
         calls = 0
