@@ -62,7 +62,7 @@ The timestamp above is an example, not your account's reset time. The supervisor
 
 Claude Code quota telemetry is collected by the project status line into `.agent-loop/claude-quota.json`. Claude supplies the five-hour and seven-day windows after the first response for Claude.ai subscribers; if those fields are unavailable, the supervisor continues safely and falls back to quota-error detection.
 
-`usage` reads live telemetry from all three providers before you commit to a plan: Codex's app-server, Claude's `/usage` command, and the local `antigravity-usage` utility. Install the latter once and set `AGENT_LOOP_ANTIGRAVITY_USAGE_DIR` if it is not at `/tmp/antigravity-usage`; missing telemetry is reported explicitly rather than treated as available quota.
+`usage` reads live telemetry from all three providers before you commit to a plan: Codex's app-server, Claude's `/usage` command, and Antigravity's official headless `/usage` command. Missing telemetry is reported explicitly rather than treated as available quota.
 
 ## Operating a run
 

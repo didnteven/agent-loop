@@ -329,7 +329,42 @@ def claude_limits(cwd, timeout=30):
 
 
 def antigravity_limits(cwd, timeout=30):
-    """Read Antigravity quota through the installed local utility's JSON interface."""
+    """Read Antigravity quota through its official headless ``/usage`` command.
+
+    Recent ``agy`` versions expose the same quota panel through a zero-turn
+    JSON command.  Keep the older local utility as a compatibility fallback for
+    installations that predate that interface.
+    """
+    try:
+        code, out, err = run_process(
+            ["agy", "-p", "/usage", "--output-format", "json", "--print-timeout",
+             str(timeout) + "s"], cwd, timeout)
+        if code:
+            raise RuntimeError((out + err)[-2000:] or "Antigravity usage command failed")
+        data = _json_from_output(out)
+        windows = []
+        command_data = data.get("command", {}).get("data", {})
+        for group in command_data.get("groups", []):
+            for bucket in group.get("buckets", []):
+                remaining = bucket.get("remaining_fraction")
+                if not isinstance(remaining, (int, float)):
+                    continue
+                window = {"usedPercent": round(max(0, min(100, (1 - remaining) * 100)), 6)}
+                reset = bucket.get("reset_time")
+                if isinstance(reset, str):
+                    try:
+                        window["resetsAt"] = datetime.fromisoformat(
+                            reset.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        pass
+                windows.append(window)
+        if windows:
+            return {"rate_limits": {"models": windows}, "source": "agy /usage", "raw": data}
+        raise ValueError("Antigravity /usage returned no quota windows")
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Compatibility with the pre-1.1.28 development utility.
     utility = os.environ.get("AGENT_LOOP_ANTIGRAVITY_USAGE_DIR", "/tmp/antigravity-usage")
     runner = os.path.join(utility, "node_modules", ".bin", "tsx")
     entrypoint = os.path.join(utility, "src", "index.ts")
