@@ -133,12 +133,20 @@ def run_process(argv, cwd, timeout=180, stdin=None, idle_timeout=None, activity=
 
 
 def command(provider, prompt, model=None, effort=None, worker=True, sandbox=False,
-            workspace=None):
+            workspace=None, scope="files"):
     effort = effort or (model.rsplit("-", 1)[-1]
                         if provider == "antigravity" and model
                         and model.rsplit("-", 1)[-1] in ("low", "medium", "high")
                         else "low")
-    if worker:
+    if worker and scope == "worktree":
+        prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
+                   "teammate, agent, or secondary model. Complete this task in the "
+                   "current session. You may read and edit any file in this worktree and "
+                   "run builds, tests, generators and dependency installs (for example "
+                   "`npx playwright install`) as needed. Do not commit or change branches. "
+                   "Finish with a concise summary of what you changed and anything that "
+                   "still blocks the task.")
+    elif worker:
         prompt += ("\n\nExecution constraint: do not delegate, spawn, or call any subagent, "
                    "teammate, agent, or secondary model. Complete this task in the "
                    "current session. Use your repository tools to inspect and edit the "
@@ -153,9 +161,18 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
                 "--disable", "multi_agent", "--disable", "multi_agent_v2",
                 "-s", "workspace-write", "-c", 'approval_policy="never"',
                 "-c", 'model_reasoning_effort="' + effort + '"']
+        if worker and scope == "worktree":
+            # Dependency installs and browser downloads need the network.
+            argv += ["-c", "sandbox_workspace_write.network_access=true"]
         if model:
             argv += ["--model", model]
         argv.append(prompt)
+    elif provider == "claude" and worker and scope == "worktree":
+        # Full tools, including Bash: builds, generators and installs are part of
+        # the work. Only delegation stays disabled.
+        argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "default",
+                "--disallowed-tools", "Agent", "--no-session-persistence",
+                "--permission-mode", "bypassPermissions", "--effort", effort]
     elif provider == "claude":
         argv = ["claude", "-p", prompt, "--output-format", "json", "--tools", "default",
                 "--disallowed-tools", "Agent", "--safe-mode", "--no-session-persistence",
@@ -199,6 +216,102 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
     return argv
 
 
+SYSTEM_INSTRUCTIONS = ("claude", "codex")
+
+
+def supervisor_command(provider, prompt, model=None, effort=None, session_id=None,
+                       workspace=None, instructions=None):
+    """A read-only, resumable supervisor session. Never a plan/approval mode.
+
+    Plan modes tell the model it is drafting for a human to approve, so it waits
+    instead of acting. Read-only comes from the tool set or sandbox instead.
+    ``instructions`` is the supervisor role, sent as system/developer
+    instructions on every call where the CLI supports it (SYSTEM_INSTRUCTIONS);
+    other providers must carry it in the prompt. ``session_id`` resumes the
+    provider's own conversation; None starts a fresh one.
+    """
+    effort = effort or "medium"
+    if provider == "claude":
+        # Read-only by tool list alone. Not --permission-mode plan: that tells the
+        # model it is drafting a plan for user approval, so it never dispatches.
+        argv = ["claude", "-p", prompt, "--output-format", "json",
+                "--tools", "Read,Grep,Glob", "--effort", effort]
+        if instructions:
+            argv += ["--append-system-prompt", instructions]
+        if model:
+            argv += ["--model", model]
+        if session_id:
+            argv += ["--resume", session_id]
+    elif provider == "codex":
+        options = ["--json", "--skip-git-repo-check",
+                   "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
+                   "-c", 'model_reasoning_effort="' + effort + '"',
+                   "--disable", "multi_agent", "--disable", "multi_agent_v2"]
+        if instructions:
+            # A TOML basic string; JSON string escaping is a valid subset of it.
+            options += ["-c", "developer_instructions=" + json.dumps(instructions)]
+        if model:
+            options += ["--model", model]
+        if session_id:
+            argv = ["codex", "exec", "resume", *options, session_id, prompt]
+        else:
+            argv = ["codex", "exec", *options, prompt]
+    elif provider == "antigravity":
+        # No --mode and no permission bypass: headless agy then denies writes and
+        # commands on its own (measured), while reads still work.
+        argv = ["agy", "-p", prompt, "--output-format", "json",
+                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
+        if workspace:
+            argv += ["--add-dir", str(workspace)]
+        if model:
+            argv += ["--model", model]
+        if session_id:
+            argv += ["--conversation", session_id]
+    else:
+        raise ValueError("Unknown provider: " + provider)
+    return argv
+
+
+SESSION_KEYS = {"codex": "thread_id", "claude": "session_id", "antigravity": "conversation_id"}
+
+
+def session_id(provider, out):
+    """The provider's resumable conversation id from its JSON output, or None."""
+    key = SESSION_KEYS.get(provider)
+    found = None
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get(key), str):
+            found = event[key]
+    if found is None:
+        try:
+            event = _json_from_output(out)
+            found = event.get(key) if isinstance(event.get(key), str) else None
+        except ValueError:
+            pass
+    return found
+
+
+def context_tokens(provider, usage):
+    """Approximate size of the conversation the provider just processed.
+
+    Claude reports per-iteration usage; the last iteration is the live context.
+    Codex and Antigravity report turn totals, which over-estimate it, so a reset
+    happens early rather than late.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    if provider == "claude":
+        iterations = usage.get("iterations")
+        last = iterations[-1] if isinstance(iterations, list) and iterations else usage
+        return sum(last.get(name, 0) or 0 for name in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    return usage.get("input_tokens", 0) or 0
+
+
 def runner_command(provider, argv, workspace, timeout, unknown_retry_seconds=1800,
                    quota_bucket="codex", idle_timeout=None, watch=()):
     """Run one provider through the quota-aware provider boundary.
@@ -239,6 +352,44 @@ def usage_fraction(data):
     visit(data)
     # The binding constraint is the window closest to exhaustion.
     return max(seen) if seen else None
+
+
+def quota_expiry(data, now=None):
+    """When the provider's longest quota window resets: unused allowance is lost then.
+
+    Short (five-hour) windows reset for everyone within hours, so comparing them
+    says little; the longest window is the allowance that is actually wasted.
+    Window length comes from ``windowDurationMins`` when reported, otherwise the
+    window with the latest reset is taken as the longest. Returns None if unknown.
+    """
+    now = time.time() if now is None else now
+    if isinstance(data, dict):
+        # Codex also lists other limit ids (reserve pools); only the account's own
+        # top-level windows describe the allowance this CLI spends.
+        data = data.get("rateLimits", data.get("rate_limits", data))
+    windows = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            used = value.get("usedPercent", value.get("used_percentage"))
+            reset = value.get("resetsAt", value.get("resets_at"))
+            if isinstance(used, (int, float)) and isinstance(reset, (int, float)) and reset > now:
+                duration = value.get("windowDurationMins")
+                windows.append((duration if isinstance(duration, (int, float)) else -1, reset))
+            for key, child in value.items():
+                if key != "rateLimitsByLimitId":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data)
+    if not windows:
+        return None
+    if any(duration > 0 for duration, _ in windows):
+        longest = max(duration for duration, _ in windows)
+        return min(reset for duration, reset in windows if duration == longest)
+    return max(reset for _, reset in windows)
 
 
 def quota_deadline(data, now=None):
@@ -289,11 +440,16 @@ def _claude_usage_snapshot(cwd, timeout=30):
 def _parse_claude_reset(value, now=None):
     """Parse Claude's human-readable local reset into a Unix timestamp."""
     now = datetime.now().astimezone() if now is None else datetime.fromtimestamp(now).astimezone()
-    match = re.search(r"resets\s+([A-Z][a-z]{2}\s+\d{1,2}\s+at\s+\d{1,2}:\d{2}\s*[ap]m)", value)
+    # Only the label's own line: a line without a reset must not borrow the next one's.
+    line = value.splitlines()[0] if value else ""
+    match = re.search(r"resets\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
+                      line)
     if not match:
         return None
-    parsed = datetime.strptime(match.group(1), "%b %d at %I:%M%p").replace(
-        year=now.year, tzinfo=now.tzinfo)
+    month, day, hour, minute, half = match.groups()
+    # Claude omits ":00" on the hour ("resets Sep 16 at 5pm").
+    parsed = datetime.strptime("%d %s %s %s:%s%s" % (now.year, month, day, hour, minute or "00", half),
+                               "%Y %b %d %I:%M%p").replace(tzinfo=now.tzinfo)
     if parsed.timestamp() < now.timestamp() - 86400:
         parsed = parsed.replace(year=now.year + 1)
     return parsed.timestamp()

@@ -95,7 +95,37 @@ def main():
     retry = sub.add_parser("retry", help="Retry a repaired authentication/configuration failure")
     retry.add_argument("run_id")
     retry.add_argument("task_id")
+    lite = sub.add_parser("lite", help="Keeper loop: local rules + read-only supervisor + workers")
+    lite_sub = lite.add_subparsers(dest="lite_command", required=True)
+    lite_start = lite_sub.add_parser("start", help="Start a new lite run for a goal")
+    lite_start.add_argument("goal")
+    lite_start.add_argument("--id", help="Run id (default: slug of the goal)")
+    lite_start.add_argument("--base", default="HEAD", help="Git ref to branch from")
+    for target in (lite_start, lite_sub.add_parser("resume", help="Resume a lite run")):
+        if target is not lite_start:
+            target.add_argument("run_id")
+        target.add_argument("--supervisors", help="Comma-separated preference, e.g. claude,codex")
+        target.add_argument("--workers", help="Comma-separated worker providers")
+        target.add_argument("--supervisor-model", action="append", default=[],
+                            metavar="PROVIDER=MODEL")
+        target.add_argument("--provider-order", choices=["expiring", "least_used"],
+                            help="Pick providers whose long quota window resets soonest "
+                                 "(default) or the least used")
+        target.add_argument("--catalog", metavar="FILE",
+                            help="JSON list of worker models: {provider, tier, model, effort?}")
+        target.add_argument("--setup", action="append", default=[], metavar="COMMAND",
+                            help="Shell command the keeper runs once in a new worktree")
+        target.add_argument("--keeper-model", help="Local Ollama model for result summaries")
+        target.add_argument("--reset-at-tokens", type=int,
+                            help="Start a fresh supervisor session above this context size")
+        target.add_argument("--max-turns", type=int, help="Stop after this many supervisor turns")
+    lite_status = lite_sub.add_parser("status")
+    lite_status.add_argument("run_id")
+    lite_tail = lite_sub.add_parser("tail", help="Follow the run journal")
+    lite_tail.add_argument("run_id")
     args = parser.parse_args()
+    if args.command == "lite":
+        return lite_main(args)
     engine = Engine(args.repo)
     try:
         if args.command == "status":
@@ -299,6 +329,61 @@ def main():
     finally:
         engine.db.close()
     return 0
+
+
+def lite_options(args):
+    options = {"keeper_model": args.keeper_model, "reset_at_tokens": args.reset_at_tokens,
+               "provider_order": args.provider_order}
+    for name in ("supervisors", "workers"):
+        value = getattr(args, name)
+        if value:
+            options[name] = [item.strip() for item in value.split(",") if item.strip()]
+    from .lite import DEFAULTS
+    models = {}
+    for item in args.supervisor_model:
+        provider, _, model = item.partition("=")
+        if not model:
+            raise ValueError("--supervisor-model needs PROVIDER=MODEL")
+        models[provider] = model
+    if models:
+        options["supervisor_models"] = {**DEFAULTS["supervisor_models"], **models}
+    if args.catalog:
+        catalog = json.loads(Path(args.catalog).read_text())
+        if (not isinstance(catalog, list) or not all(
+                isinstance(entry, dict) and entry.get("provider") and entry.get("tier")
+                and entry.get("model") for entry in catalog)):
+            raise ValueError("--catalog must be a JSON list of {provider, tier, model}")
+        options["catalog"] = catalog
+    if args.setup:
+        options["setup"] = args.setup
+    return {key: value for key, value in options.items() if value is not None}
+
+
+def lite_main(args):
+    from .lite import LiteRun, slug
+    if args.lite_command == "start":
+        run = LiteRun(args.repo, args.id or slug(args.goal))
+        run.create(args.goal, args.base, lite_options(args))
+    else:
+        run = LiteRun(args.repo, args.run_id)
+    if args.lite_command == "status":
+        print(run.status())
+        return 0
+    if args.lite_command == "tail":
+        with run.path("journal.jsonl").open() as stream:
+            while True:
+                line = stream.readline()
+                if line:
+                    print(line, end="", flush=True)
+                else:
+                    time.sleep(0.5)
+    if args.lite_command == "resume":
+        options = lite_options(args)
+        if options:
+            run.save("config.json", {**run.load("config.json", {}), **options})
+    state = run.run(args.max_turns)
+    print(run.status())
+    return 0 if state["finished"] else 3
 
 
 if __name__ == "__main__":
