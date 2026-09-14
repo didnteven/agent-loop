@@ -87,6 +87,20 @@ class AdapterTests(unittest.TestCase):
                 limits = antigravity_limits(tempfile.gettempdir())
         self.assertEqual(limits["rate_limits"]["models"][0]["usedPercent"], 75)
 
+    def test_antigravity_limits_reads_official_usage_command(self):
+        usage = {
+            "status": "SUCCESS",
+            "command": {"data": {"groups": [{"name": "Gemini Models", "buckets": [
+                {"remaining_fraction": 0.96, "reset_time": "2026-09-13T05:11:51Z"}
+            ]}]}}
+        }
+        with patch("loop.adapters.run_process",
+                   return_value=(0, json.dumps(usage), "")) as run:
+            limits = antigravity_limits(tempfile.gettempdir())
+        self.assertEqual(limits["source"], "agy /usage")
+        self.assertEqual(limits["rate_limits"]["models"][0]["usedPercent"], 4)
+        self.assertEqual(run.call_args.args[0][:3], ["agy", "-p", "/usage"])
+
     def test_provider_limits_dispatches_every_supported_provider(self):
         with patch("loop.adapters.codex_limits", return_value={"codex": 1}) as codex, \
                 patch("loop.adapters.claude_limits", return_value={"claude": 1}) as claude, \
