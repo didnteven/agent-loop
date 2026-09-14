@@ -86,6 +86,49 @@ A task with `"provider": "command"` and a `"run"` argv executes a trusted host c
 
 A task's optional `review` (`{"provider": "claude", "model": ..., "instructions": "...", "attach": [...]}`) adds a model quality gate after the trusted check passes and before commit. The reviewer sees the task, the text diff and the absolute paths of changed media (images, video) to open; a decline or an unavailable reviewer fails the attempt with its reasoning, and a reviewer that edits the worktree voids its verdict. It costs one review call per attempt, so it is opt-in.
 
+## Lite keeper loop (trial)
+
+`loop lite` is a much smaller alternative to the plan engine for runs that should keep going
+instead of parking:
+
+```sh
+python3 -m loop --repo /path/to/repo lite start "Fix the strict SEO gate failures" \
+  --supervisors claude,codex,antigravity --workers codex,claude
+python3 -m loop --repo /path/to/repo lite start "..." --setup "cd apps/web && npm ci" \
+  --catalog models.json --supervisor-model claude=claude-opus-5
+python3 -m loop --repo /path/to/repo lite status <id>
+python3 -m loop --repo /path/to/repo lite tail <id>
+python3 -m loop --repo /path/to/repo lite resume <id>
+```
+
+There are three layers:
+
+- **Supervisor:** a cloud model running a read-only, resumable CLI session, never in a plan or approval mode (claude `--tools Read,Grep,Glob`, codex `sandbox_mode="read-only"`, agy's default headless mode, which denies writes). The supervisor role is sent as system/developer instructions (claude `--append-system-prompt`, codex `developer_instructions`), or in the prompt for agy. Each turn it gets the goal, plan, handoff notes and new worker results, and replies with JSON actions: `plan`, `dispatch`, `accept`, `discard`, `note`, `wait`, `done`. Any file change it makes is reverted.
+- **Workers:** full coding agents in `.agent-loop/worktrees/lite-<id>` (branch `lite/<id>`). They can edit any file and run builds or installs; only delegation is disabled. When a task's `check` passes, all changes are committed. When it fails, the changes stay uncommitted and the supervisor decides what to do next.
+- **Keeper:** Python rules (`loop/keeper.py`), not a model, decide after every turn:
+  - **Switch** supervisors when quota or auth runs out.
+  - **Wait** until the earliest reset when nothing is available.
+  - **Remind**, then reset, a supervisor that edits files or pastes code.
+  - **Reset** the session above `--reset-at-tokens` (default 120k).
+  - **Rotate** after 4 stagnant turns.
+
+The local Ollama model (`--keeper-model`, default `qwen2.5:7b`) only compresses worker results into handoff notes, with a deterministic fallback when Ollama is down. In testing, qwen2.5:7b chose the right action only 9 times out of 18, but extracted blockers and fix commands reliably.
+
+Workers can only use models from a tiered catalog, and the supervisor picks a tier or an exact model for each dispatch. You can replace the catalog with `--catalog`, a JSON list of `{provider, tier, model, effort?}`.
+
+| Tier | claude | codex | antigravity |
+|---|---|---|---|
+| light | claude-haiku-4-5-20251001 | gpt-5.6-luna (low) | gemini-3.8-flash-low |
+| standard | claude-sonnet-5 | gpt-5.6-terra | gemini-3.8-flash-medium |
+| strong | claude-opus-5 | gpt-5.6-sol | gemini-3.8-flash-high |
+
+- **Refused models:** a model outside the catalog (such as `gpt-6-astra` or Gemini Pro) falls back to the standard tier, and the supervisor is told.
+- **Retired models:** entries that `agy models` or Codex's model cache no longer list are dropped at startup.
+- **History:** each task records its tier, model and outcome per attempt.
+- **Codex supervisor:** runs on `gpt-5.6-sol` and moves to `gpt-6-astra` only for the fresh session after the keeper finds it stuck. `--setup` commands, such as dependency installs, run once per worktree without a model call. `lite status` shows estimated spend split into supervisor and worker.
+
+All state lives in `.agent-loop/lite/<id>/` (`goal.md`, `plan.json`, `handoff.md`, `supervisor.json`, `journal.jsonl`, `logs/`), so a fresh session or a different provider picks up from files. The run ends only when `done` verifies (every task done or dropped, clean tree, all checks pass), or on Ctrl-C. Supervisor-written checks run on the host, so use this only on repositories you trust.
+
 ## Two-pass planning
 
 Use `plan` to check all provider quotas first, have a budget model scout the repository, and have a stronger model turn those notes into a validated plan:
