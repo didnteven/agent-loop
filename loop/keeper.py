@@ -112,7 +112,9 @@ class Ollama:
 
     def chat(self, system, user, schema):
         data = self._post("/api/chat", {
-            "model": self.model, "stream": False, "format": schema, "keep_alive": "30m",
+            # Summaries arrive minutes apart; holding ~5 GB of model in memory
+            # between them starved the machine. Reloading costs seconds.
+            "model": self.model, "stream": False, "format": schema, "keep_alive": "2m",
             "options": {"temperature": 0, "num_ctx": 8192},
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}]}, self.timeout)

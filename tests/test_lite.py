@@ -67,7 +67,7 @@ class Harness:
     def invoke(self, argv, cwd, timeout, idle_timeout=None, activity=None, tee=None):
         self.argvs.append(argv)
         supervisor = ("Read,Grep,Glob" in argv or 'sandbox_mode="read-only"' in argv
-                      or (argv[0] == "agy" and "--dangerously-skip-permissions" not in argv))
+                      or (argv[0] == "agy" and "plan" in argv))
         if supervisor:
             self.prompts.append(argv[2] if argv[0] in ("claude", "agy") else argv[-1])
             return self.supervisor_replies.pop(0)(Path(cwd))
@@ -369,10 +369,12 @@ class LiteRunTests(unittest.TestCase):
         developer = [arg for arg in codex if arg.startswith("developer_instructions=")][0]
         self.assertEqual(json.loads(developer.split("=", 1)[1]), ROLE)
         agy = supervisor_command("antigravity", "msg", session_id="u")
-        for argv in (claude, codex, agy):
+        for argv in (claude, codex):
             self.assertNotIn("plan", argv)
             self.assertNotIn("--permission-mode", argv)
-            self.assertNotIn("--mode", argv)
+        # agy's default headless mode denies reads too; its plan mode reads,
+        # blocks writes and still replies with actions.
+        self.assertEqual(agy[agy.index("--mode") + 1], "plan")
         self.assertNotIn("--dangerously-skip-permissions", agy)
 
     def test_prompt_carries_role_only_for_providers_without_system_prompts(self):

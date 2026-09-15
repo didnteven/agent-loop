@@ -221,10 +221,11 @@ SYSTEM_INSTRUCTIONS = ("claude", "codex")
 
 def supervisor_command(provider, prompt, model=None, effort=None, session_id=None,
                        workspace=None, instructions=None):
-    """A read-only, resumable supervisor session. Never a plan/approval mode.
+    """A read-only, resumable supervisor session.
 
-    Plan modes tell the model it is drafting for a human to approve, so it waits
-    instead of acting. Read-only comes from the tool set or sandbox instead.
+    Claude's plan mode tells the model it is drafting for a human to approve, so
+    it waits instead of acting; claude and codex get read-only from their tool
+    set or sandbox instead. agy is the exception (see below).
     ``instructions`` is the supervisor role, sent as system/developer
     instructions on every call where the CLI supports it (SYSTEM_INSTRUCTIONS);
     other providers must carry it in the prompt. ``session_id`` resumes the
@@ -257,9 +258,11 @@ def supervisor_command(provider, prompt, model=None, effort=None, session_id=Non
         else:
             argv = ["codex", "exec", *options, prompt]
     elif provider == "antigravity":
-        # No --mode and no permission bypass: headless agy then denies writes and
-        # commands on its own (measured), while reads still work.
-        argv = ["agy", "-p", prompt, "--output-format", "json",
+        # Measured: headless agy's default mode denies every tool, reads included,
+        # and then produces no output. Unlike claude, agy's plan mode allows reads,
+        # blocks writes, and still answers with the JSON actions when the prompt
+        # says nobody approves plans. So agy is the one supervisor in plan mode.
+        argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
                 "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
         if workspace:
             argv += ["--add-dir", str(workspace)]
