@@ -375,6 +375,7 @@ class LiteRunTests(unittest.TestCase):
         # agy's default headless mode denies reads too; its plan mode reads,
         # blocks writes and still replies with actions.
         self.assertEqual(agy[agy.index("--mode") + 1], "plan")
+        self.assertNotIn("--disable-slash-commands", agy)  # would silently cancel plan mode
         self.assertNotIn("--dangerously-skip-permissions", agy)
 
     def test_prompt_carries_role_only_for_providers_without_system_prompts(self):

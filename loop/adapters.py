@@ -262,8 +262,10 @@ def supervisor_command(provider, prompt, model=None, effort=None, session_id=Non
         # and then produces no output. Unlike claude, agy's plan mode allows reads,
         # blocks writes, and still answers with the JSON actions when the prompt
         # says nobody approves plans. So agy is the one supervisor in plan mode.
+        # No --disable-slash-commands here: agy ignores --mode plan when it is set
+        # ("--mode plan has no effect while slash command expansion is disabled").
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
+                "--effort", effort, "--print-timeout", "24h"]
         if workspace:
             argv += ["--add-dir", str(workspace)]
         if model:
