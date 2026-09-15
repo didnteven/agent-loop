@@ -37,6 +37,50 @@ def code_lines(text):
     return total
 
 
+def skeleton_keys(text, head=6, tail=6):
+    """Opening and closing word runs of a line, with per-item decoration removed.
+
+    Templates evade exact-duplicate checks by appending ids, quoting the item, or
+    slotting a name into a fixed sentence. The fixed parts that remain (how the
+    line starts and ends) are what repeat.
+    """
+    value = re.sub(r"\b[0-9a-f]{6,}\b", " ", str(text).lower())
+    value = re.sub(r"[\"“”'‘’][^\"“”'‘’]{3,}[\"“”'‘’]", " ", value)
+    value = re.sub(r"\([^)]*\)", " ", value)
+    words = re.findall(r"[a-z]+", value)
+    if len(words) < max(head, tail) + 2:
+        return []
+    return ["starts: " + " ".join(words[:head]), "ends: " + " ".join(words[-tail:])]
+
+
+def template_report(added_lines, minimum=10):
+    """How much of a change is one sentence pattern repeated.
+
+    Returns None below ``minimum`` prose lines, else the most repeated opening or
+    ending, its count, and its share of prose lines. Tables and code rows are
+    ignored: repetition there is normal.
+    """
+    prose = []
+    for line in added_lines:
+        stripped = line.strip()
+        # Judge the prose inside a JSON value or string literal, not the code around it.
+        literals = re.findall(r'"((?:[^"\\]|\\.){30,})"|\'((?:[^\'\\]|\\.){30,})\'', stripped)
+        value = max((a or b for a, b in literals), key=len) if literals else stripped
+        if value.startswith(("|", "#", "-", "{", "}", "[", "]")) or value.count(";") >= 2:
+            continue
+        if skeleton_keys(value):
+            prose.append(value)
+    if len(prose) < minimum:
+        return None
+    counts = {}
+    for value in prose:
+        for key in skeleton_keys(value):
+            counts[key] = counts.get(key, 0) + 1
+    key, count = max(counts.items(), key=lambda item: item[1])
+    return {"prose_lines": len(prose), "pattern": key, "count": count,
+            "share": round(count / len(prose), 3)}
+
+
 def decide(obs):
     """The next supervisor action from one turn's observation. No model call.
 

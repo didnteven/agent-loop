@@ -41,7 +41,8 @@ class FakeClient:
 class Harness:
     """Scripted supervisor replies and worker behaviours behind ``invoke``."""
 
-    def __init__(self, testcase, supervisors=("claude", "codex"), reset_at=120000):
+    def __init__(self, testcase, supervisors=("claude", "codex"), reset_at=120000, audit=False,
+                 gates=()):
         directory = tempfile.TemporaryDirectory()
         testcase.addCleanup(directory.cleanup)
         self.repo = Path(directory.name) / "repo"
@@ -54,6 +55,8 @@ class Harness:
         sh(self.repo, "git", "commit", "-qm", "init")
         self.supervisor_replies = []   # callables(worktree) -> (code, out, err)
         self.worker_actions = []       # callables(worktree) -> (code, out, err)
+        self.audit_replies = []        # callables(worktree) -> (code, out, err)
+        self.audit_prompts = []
         self.prompts, self.argvs = [], []
         self.client = FakeClient({"blocker": None, "suggested_fix_command": None,
                                   "progress": ["did it"], "handoff": "summary"})
@@ -62,14 +65,20 @@ class Harness:
                            out=lambda m: None, models=lambda provider: None)
         self.run.create("Make value 2", options={"supervisors": list(supervisors),
                                                  "workers": ["claude", "codex"],
-                                                 "reset_at_tokens": reset_at})
+                                                 "reset_at_tokens": reset_at,
+                                                 "audit": {"enabled": audit, "sample": 1.0},
+                                                 "gates": list(gates)})
 
     def invoke(self, argv, cwd, timeout, idle_timeout=None, activity=None, tee=None):
         self.argvs.append(argv)
         supervisor = ("Read,Grep,Glob" in argv or 'sandbox_mode="read-only"' in argv
                       or (argv[0] == "agy" and "plan" in argv))
         if supervisor:
-            self.prompts.append(argv[2] if argv[0] in ("claude", "agy") else argv[-1])
+            prompt = argv[2] if argv[0] in ("claude", "agy") else argv[-1]
+            if "AUDIT REQUEST" in prompt:
+                self.audit_prompts.append((argv, prompt))
+                return self.audit_replies.pop(0)(Path(cwd))
+            self.prompts.append(prompt)
             return self.supervisor_replies.pop(0)(Path(cwd))
         return self.worker_actions.pop(0)(Path(cwd))
 
@@ -506,6 +515,102 @@ class LiteRunTests(unittest.TestCase):
         self.assertEqual(cost["supervisor:claude"], {"calls": 1, "estimated_usd": 0.25})
         self.assertEqual(cost["worker:claude"], {"calls": 1, "estimated_usd": 0.5})
         self.assertIn("worker:claude $0.50", h.run.status())
+
+    def test_keeper_gate_blocks_commit_even_when_task_check_passes(self):
+        h = Harness(self, gates=["test ! -e forbidden.txt"])
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n", "forbidden.txt": "x\n"}))
+        h.run.run(max_turns=1)
+        self.assertEqual(h.plan()["bump"]["status"], "failed")
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "gate_failed")
+        self.assertIn("Keeper gate failed", record["output_tail"])
+        self.assertEqual(sh(h.run.worktree, "git", "log", "--oneline").count("\n"), 0)  # only init
+        self.assertIn("KEEPER GATES", h.prompts[0])
+
+    def test_gate_added_mid_run_applies_to_done(self):
+        h = Harness(self)
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.run.run(max_turns=1)
+        h.run.add_gate("grep -q 'value = 3' app.py")
+        h.supervisor_replies.append(reply(actions({"op": "done", "summary": "x"})))
+        state = h.run.run(max_turns=1)
+        self.assertFalse(state["finished"])
+        self.assertIn("A keeper gate was added", h.prompts[-1])
+        h.supervisor_replies.append(reply(actions({"op": "note", "text": "n"})))
+        h.run.run(max_turns=1)
+        self.assertIn("Keeper gate failed", h.prompts[-1])
+
+    def test_audit_by_another_provider_can_block_a_passing_change(self):
+        h = Harness(self, audit=True)
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (0, "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "a"}),
+            json.dumps({"item": {"type": "agent_message", "text": json.dumps(
+                {"verdict": "fail", "problems": ["app.py: value hard-coded to satisfy the check"],
+                 "confidence": "high"})}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5}})]), ""))
+        h.run.run(max_turns=1)
+        argv, prompt = h.audit_prompts[0]
+        self.assertEqual(argv[0], "codex")                 # not the worker's provider (claude)
+        self.assertIn("+value = 2", prompt)               # the auditor sees the diff
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "audit_failed")
+        self.assertIn("hard-coded", record["output_tail"])
+        self.assertEqual(h.plan()["bump"]["status"], "failed")
+        self.assertEqual((h.run.worktree / "app.py").read_text(), "value = 2\n")  # kept, uncommitted
+
+    def test_unavailable_audit_does_not_block_progress(self):
+        h = Harness(self, audit=True)
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (1, "", "connection reset"))
+        h.run.run(max_turns=1)
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "passed")
+        self.assertEqual(record["audit"]["verdict"], "unavailable")
+        self.assertEqual(h.plan()["bump"]["status"], "done")
+
+    def test_templated_change_is_flagged_with_a_diff_sample(self):
+        h = Harness(self)
+        lines = "\n".join("reason_%d = 'Reviewed as an adjustable %s cue, not a claim of guaranteed anatomy health or outcome.'"
+                          % (i, muscle) for i, muscle in enumerate(
+                              ["glute", "curl", "hamstring", "calf", "lat", "quad", "chest", "trap", "delt", "ab", "neck"]))
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n", "reasons.py": lines + "\n"}))
+        h.run.run(max_turns=1)
+        record = h.state()["pending"][0]
+        self.assertIn("template_warning", record)
+        self.assertGreaterEqual(record["template_warning"]["share"], 0.8)
+        self.assertIn("+value = 2", record["diff_sample"])
+
+    def test_operator_note_reaches_resumed_and_fresh_sessions(self):
+        h = Harness(self)
+        h.supervisor_replies.append(reply(actions({"op": "note", "text": "n"})))
+        h.run.run(max_turns=1)
+        h.run.note("Prefer claude-sonnet-5 for adjudication batches.")
+        h.supervisor_replies.append(reply(actions({"op": "note", "text": "n2"})))
+        h.run.run(max_turns=1)
+        self.assertIn("OPERATOR NOTE", h.prompts[-1])
+        self.assertTrue(h.prompts[-1].startswith("UPDATE FROM THE KEEPER"))
+        state = h.state()
+        state["session_id"] = None
+        h.run.save("supervisor.json", state)
+        h.supervisor_replies.append(reply(actions({"op": "note", "text": "n3"})))
+        h.run.run(max_turns=1)
+        self.assertIn("OPERATOR NOTES (standing instructions", h.prompts[-1])
+        self.assertIn("Prefer claude-sonnet-5", h.prompts[-1])
+        self.assertEqual(h.run.load("supervisor.json")["inbox_seen"], 1)   # not re-delivered
+
+    def test_template_report_ignores_tables_and_short_changes(self):
+        self.assertIsNone(keeper.template_report(["| a | b |"] * 30))
+        self.assertIsNone(keeper.template_report(["A single honest sentence about this exact item."] * 3))
+        varied = ["Claim %d is supported by the cited trial measuring %s in trained adults." % (i, w)
+                  for i, w in enumerate("strength power mass speed endurance balance grip reach flexibility sprint".split())]
+        report = keeper.template_report(varied)
+        self.assertIsNotNone(report)   # same ending on all of them: reported, share decides
 
     def test_invalid_json_and_repeats_rotate_supervisor(self):
         h = Harness(self)

@@ -60,6 +60,19 @@ DEFAULTS = {
     "check_timeout_seconds": 1200,
     "unknown_retry_seconds": 1800,
     "fresh_prompt_characters": 60000,
+    # Keeper-owned acceptance gates: shell commands that must pass, in addition to a
+    # task's own check, before any task is committed and before `done`. The
+    # supervisor writes task checks and cannot see or weaken these.
+    "gates": [],
+    # After checks and gates pass, a different provider audits the diff read-only
+    # for work that satisfies checks without doing the task. sample is the share of
+    # passing attempts audited (1.0 = every one).
+    "audit": {"enabled": True, "sample": 1.0},
+    # A change where one sentence pattern makes up at least this share of its prose
+    # is flagged to the supervisor and auditor as likely templated.
+    "template_share": 0.2,
+    "audit_diff_characters": 30000,
+    "result_diff_characters": 4000,
 }
 ROLE = """You are the SUPERVISOR of an automated coding run. You plan, delegate and review.
 You may read the repository (read-only tools). You must NOT edit files, run builds, or write
@@ -86,6 +99,19 @@ lower tier. Among equal choices prefer the provider whose quota resets soonest. 
 the catalog are not allowed; omitting `model` means standard.
 Don't dispatch a worker just to install dependencies or run a command the keeper's setup
 already ran (see KEEPER NOTES).
+
+Verify, don't trust. Workers optimise for passing whatever check you write, and a check that
+only looks at shape (a file exists, a field is set, a validator exits 0) can pass with no real
+work done. Write checks that test substance. Each result includes a DIFF SAMPLE, and you can
+read files in the worktree: before relying on "passed", look at what actually changed. Treat
+these as failures to re-dispatch with specific feedback:
+- output where many items follow one template when each should be individual
+- invented references or ids
+- checks satisfied by special-casing
+- unchanged dates or text passed off as new work
+The keeper may also run its own GATES and an independent AUDIT by another model. An
+"audit_failed" or "gate_failed" outcome means the change was not committed; its problems are
+in the result.
 
 Keep your notes current: the keeper may restart you in a fresh session, or on a different
 model, at any time. Your `note` is the only memory that survives besides the plan and results.
@@ -178,6 +204,38 @@ def check_argv(check):
 
 def tail(text, lines=60, characters=4000):
     return "\n".join(str(text or "").splitlines()[-lines:])[-characters:]
+
+
+AUDIT_ROLE = """You are an independent AUDITOR in an automated coding run. A worker finished a task and
+the task's checks passed. Checks can be passed without doing the work. Judge whether this change
+really does what the task asks. You are read-only: do not edit anything.
+
+Look for concrete problems:
+- templated or boilerplate output repeated across items that each needed individual work
+- invented or mismatched content: citations, ids, data, dates changed or left stale to look new
+- checks or validators made to pass by weakening, bypassing or special-casing them
+- work claimed in the task but absent from the diff
+- unrelated or destructive changes
+
+You may read files in the worktree to confirm. Fail only for problems you can point to with file
+and line evidence; do not fail for style.
+
+Reply with ONE JSON object and nothing else:
+{"verdict": "pass" or "fail", "problems": ["<file>: <specific problem and evidence>"], "confidence": "low|medium|high"}"""
+
+
+def extract_verdict(text):
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(str(text or "")):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(str(text)[index:])
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("verdict") in ("pass", "fail"):
+            return value
+    return None
 
 
 class LiteRun:
@@ -366,6 +424,154 @@ class LiteRun:
         state["setup_done"] = True
         self.save("supervisor.json", state)
 
+    # ---- evidence, gates, audit, operator inbox -------------------------------
+    def diff_text(self, limit):
+        """Uncommitted change as a diff, sampled evenly across files within ``limit``."""
+        files = changed_files(self.worktree)
+        if not files:
+            return "", []
+        tracked = set(git(self.worktree, "ls-files", "--", *files).splitlines())
+        chunks, added = [], []
+        for name in files:
+            if name in tracked:
+                body = git(self.worktree, "diff", "HEAD", "--", name)
+            else:
+                target = self.worktree / name
+                try:
+                    content = target.read_text(errors="replace") if target.is_file() else ""
+                except OSError:
+                    content = ""
+                body = "new file " + name + "\n" + "\n".join("+" + line for line in content.splitlines())
+            added += [line[1:] for line in body.splitlines()
+                      if line.startswith("+") and not line.startswith("+++")]
+            chunks.append((name, body))
+        share = max(400, limit // max(1, len(chunks)))
+        text = ""
+        for name, body in chunks:
+            piece = body if len(body) <= share else body[:share] + "\n[... %d more characters in %s]\n" % (len(body) - share, name)
+            if len(text) + len(piece) > limit:
+                text += "\n[%d more files not shown]\n" % (len(chunks) - chunks.index((name, body)))
+                break
+            text += piece + "\n"
+        return text, added
+
+    def run_gates(self):
+        """(ok, output) for every keeper gate on the current tree."""
+        outputs = []
+        for gate in self.config["gates"]:
+            code, out, err = run_process(["/bin/sh", "-c", gate], self.worktree,
+                                         self.config["check_timeout_seconds"])
+            if code:
+                return False, "Keeper gate failed (exit %d): %s\n%s" % (code, gate, tail(out + "\n" + err, 40))
+            outputs.append("gate ok: " + gate)
+        return True, "\n".join(outputs)
+
+    def audit(self, state, task, worker_provider, diff, template):
+        """Independent read-only review of a passing change; never blocks on its own failure."""
+        settings = {"enabled": True, "sample": 1.0, **(self.config.get("audit") or {})}
+        if not settings["enabled"] or not diff:
+            return {"verdict": "skipped"}
+        digest = int(hashlib.sha256((task["id"] + str(task.get("attempts"))).encode()).hexdigest(), 16)
+        if (digest % 1000) / 1000.0 >= float(settings["sample"]):
+            return {"verdict": "skipped", "reason": "not sampled"}
+        candidates = [name for name in self.available(self.config["workers"], state)
+                      if name != worker_provider]
+        if not candidates:
+            return {"verdict": "unavailable", "reason": "no provider other than the worker's is available"}
+        auditor = candidates[0]
+        model = self.resolve_model(auditor, "standard")[0]["model"]
+        prompt = ("AUDIT REQUEST\n\nTASK " + task["id"] + ": " + (task.get("title") or "") + "\n"
+                  + (task.get("prompt") or "") + "\n\nTASK CHECK: " + str(task.get("check"))
+                  + "\nKEEPER GATES: " + json.dumps(self.config["gates"])
+                  + ("\n\nTEMPLATE WARNING: %d of %d prose lines share the pattern %r."
+                     % (template["count"], template["prose_lines"], template["pattern"]) if template else "")
+                  + "\n\nWORKTREE: " + str(self.worktree) + "\n\nDIFF:\n" + diff)
+        if auditor not in SYSTEM_INSTRUCTIONS:
+            prompt = AUDIT_ROLE + "\n\n" + prompt
+        argv = supervisor_command(auditor, prompt, model, "medium", None, self.worktree,
+                                  instructions=AUDIT_ROLE if auditor in SYSTEM_INSTRUCTIONS else None)
+        snap = self.snapshot()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        log = self.dir / "logs" / ("audit-%s-%s-%s.jsonl" % (task["id"], stamp, auditor))
+        self.journal("audit", task=task["id"], auditor=auditor, model=model or "default")
+        code, out, err = self.invoke(argv, self.worktree, self.config["supervisor_max_seconds"],
+                                     idle_timeout=self.config["supervisor_idle_seconds"],
+                                     tee=(log, log.with_suffix(".stderr")))
+        result = parse(auditor, code, out, err, now=self.clock())
+        self.revert_to(snap)
+        self.account(state, "audit", auditor, result)
+        if result.status in ("rate_limited", "provider_wait", "auth_required"):
+            self.hold(state, auditor, result.retry_at or self.clock() + self.config["unknown_retry_seconds"],
+                      result.error or result.status)
+        verdict = extract_verdict(result.response) if result.status == "ok" else None
+        if verdict is None:
+            return {"verdict": "unavailable", "auditor": auditor,
+                    "reason": (result.error or "no verdict in reply")[-300:]}
+        verdict["auditor"] = auditor
+        verdict["problems"] = [str(item)[:400] for item in (verdict.get("problems") or [])][:15]
+        return verdict
+
+    def verify_passing_change(self, state, task, worker_provider):
+        """Gates, template detection and audit for a change whose own check passed.
+
+        Returns (outcome, evidence text, extra) where outcome is "passed",
+        "gate_failed" or "audit_failed".
+        """
+        diff, added = self.diff_text(self.config["audit_diff_characters"])
+        template = keeper.template_report(added)
+        if template and template["share"] < float(self.config["template_share"]):
+            template = None
+        extra = {"diff_sample": diff[:self.config["result_diff_characters"]]}
+        if template:
+            extra["template_warning"] = template
+        ok, gate_output = self.run_gates()
+        if not ok:
+            return "gate_failed", gate_output, extra
+        verdict = self.audit(state, task, worker_provider, diff, template)
+        extra["audit"] = verdict
+        self.journal("audit_result", task=task["id"], verdict=verdict.get("verdict"),
+                     problems=len(verdict.get("problems") or []))
+        if verdict.get("verdict") == "fail":
+            return "audit_failed", "Independent audit failed:\n" + "\n".join(
+                "- " + problem for problem in verdict.get("problems") or []), extra
+        return "passed", gate_output, extra
+
+    def note(self, text):
+        """Queue an operator note; the keeper delivers it before the next supervisor turn."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with self.path("inbox.jsonl").open("a") as stream:
+            stream.write(json.dumps({"at": round(self.clock(), 3), "text": str(text)}) + "\n")
+
+    def add_gate(self, command_text):
+        config = self.load("config.json", {})
+        gates = list(config.get("gates") or [])
+        if command_text not in gates:
+            gates.append(command_text)
+        config["gates"] = gates
+        self.save("config.json", config)
+        self.note("A keeper gate was added and must pass before any commit and before done: "
+                  + command_text)
+
+    def read_inbox(self, state):
+        """Operator notes appended by `lite note` since the last read."""
+        path = self.path("inbox.jsonl")
+        if not path.exists():
+            return
+        lines = path.read_text().splitlines()
+        seen = state.get("inbox_seen", 0)
+        for line in lines[seen:]:
+            try:
+                note = json.loads(line)
+            except ValueError:
+                continue
+            text = str(note.get("text") or "").strip()
+            if not text:
+                continue
+            state.setdefault("operator_notes", []).append(text)
+            state["notes_for_supervisor"].append("OPERATOR NOTE (from the person running this loop): " + text)
+            self.journal("operator_note", text=text[:200])
+        state["inbox_seen"] = len(lines)
+
     def catalog(self):
         """Worker catalog entries still offered by the installed CLIs."""
         if self._catalog is None:
@@ -451,6 +657,10 @@ class LiteRun:
         sections = [
             ROLE + "\n\n" if in_prompt else "",
             "GOAL:\n" + self.path("goal.md").read_text(),
+            ("\n\nOPERATOR NOTES (standing instructions from the person running this loop):\n- "
+             + "\n- ".join(state.get("operator_notes", [])) if state.get("operator_notes") else ""),
+            ("\n\nKEEPER GATES (must pass before any commit and before done): "
+             + json.dumps(self.config["gates"]) if self.config["gates"] else ""),
             "\n\nKEEPER NOTES:\n" + notes if notes else "",
             "\n\nPLAN:\n" + self.plan_text(),
             "\n\nWORKTREE:\n" + self.worktree_text(),
@@ -648,6 +858,7 @@ class LiteRun:
         task = self.task(plan, task["id"])
         changed = changed_files(self.worktree)
         worker_text = tail(result.response or result.error or err, 40, 2500)
+        verification = {}
         if result.status in ("rate_limited", "provider_wait", "auth_required"):
             until = result.retry_at or self.clock() + config["unknown_retry_seconds"]
             self.hold(state, provider, until, result.error or result.status)
@@ -661,10 +872,16 @@ class LiteRun:
             outcome = "passed" if check_code == 0 else "failed"
             check_output = ("Note: the worker changed files named by the check: "
                             + ", ".join(touched) + "\n" if touched else "") + tail(check_out + "\n" + check_err)
+            if outcome == "passed" and changed:
+                outcome, evidence, verification = self.verify_passing_change(state, task, provider)
+                check_output = (check_output + "\n" + evidence).strip()
         else:
             outcome = "needs_review" if changed else ("no_changes" if result.status == "ok"
                                                       else "worker_error")
             check_output = ""
+        if outcome in ("failed", "worker_error", "needs_review", "no_changes") and changed and not verification:
+            diff, _ = self.diff_text(self.config["result_diff_characters"])
+            verification = {"diff_sample": diff}
         if outcome == "passed":
             task.update(status="done", sha=self.commit(task["id"], changed))
         elif outcome == "needs_review":
@@ -681,7 +898,8 @@ class LiteRun:
         return self.report(state, task, provider, outcome,
                            (check_output + "\n\nWORKER SAID:\n" + worker_text).strip(),
                            {"worker_status": result.status, "changed_files": changed[:40],
-                            "sha": task.get("sha") if outcome == "passed" else None})
+                            "sha": task.get("sha") if outcome == "passed" else None,
+                            **verification})
 
     def report(self, state, task, provider, outcome, log_tail, extra):
         summary, source = self.scribe.summarise(task["id"], outcome, log_tail)
@@ -712,6 +930,13 @@ class LiteRun:
                 task.update(status="failed", last_outcome="failed")
                 self.save("plan.json", plan)
                 self.report(state, task, "keeper", "failed", tail(out + "\n" + err), {})
+                return
+        if changed:
+            outcome, evidence, extra = self.verify_passing_change(state, task, task.get("provider"))
+            if outcome != "passed":
+                task.update(status="failed", last_outcome=outcome)
+                self.save("plan.json", plan)
+                self.report(state, task, "keeper", outcome, evidence, extra)
                 return
         task.update(status="done", sha=self.commit(task["id"], changed), last_outcome="accepted")
         self.save("plan.json", plan)
@@ -745,6 +970,10 @@ class LiteRun:
                 if code:
                     problems.append("Check for %s fails on the final tree:\n%s"
                                     % (task["id"], tail(out + "\n" + err, 30)))
+        if not problems and self.config["gates"]:
+            ok, gate_output = self.run_gates()
+            if not ok:
+                problems.append(gate_output)
         self.revert_to((git(self.worktree, "rev-parse", "HEAD"), {}))
         if not plan["tasks"]:
             problems.append("The plan has no tasks.")
@@ -889,6 +1118,7 @@ class LiteRun:
             while not state["finished"]:
                 if max_turns is not None and turns >= max_turns:
                     break
+                self.read_inbox(state)
                 if self.held_until(state, state["provider"]):
                     obs = self.observe(state, None, [], [])
                     self.apply_decision(state, keeper.decide(obs), obs)
@@ -941,6 +1171,8 @@ class LiteRun:
                                          for name, until in state["holds"].items()
                                          if until > self.clock()) or "none"),
                  "tokens: " + json.dumps(state["tokens"]),
+                 "gates: " + (json.dumps(self.config["gates"]) if self.config["gates"] else "none"),
+                 "operator notes: %d" % len(state.get("operator_notes", [])),
                  "estimated cost: " + ", ".join(
                      "%s $%.2f (%d calls)" % (key, value["estimated_usd"], value["calls"])
                      for key, value in sorted(state.get("cost", {}).items())) or "none", ""]

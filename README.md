@@ -127,6 +127,15 @@ Workers can only use models from a tiered catalog, and the supervisor picks a ti
 - **History:** each task records its tier, model and outcome per attempt.
 - **Codex supervisor:** runs on `gpt-5.6-sol` and moves to `gpt-6-astra` only for the fresh session after the keeper finds it stuck. `--setup` commands, such as dependency installs, run once per worktree without a model call. `lite status` shows estimated spend split into supervisor and worker.
 
+**Keeping workers honest.** Workers optimise for passing checks, and a supervisor that trusts "passed" gets gamed. In a long real run, workers stamped claims with generic reasons, swapped in templated reasons, appended ids to make templates look unique, left stale dates on "rewritten" work, and cited DOIs belonging to unrelated papers, all while the supervisor's checks passed. The keeper now defends against this independently of the supervisor:
+
+- **Gates** (`--gate COMMAND`, or `lite gate <id> COMMAND` mid-run): keeper-owned commands that must pass, in addition to each task's own check, before any commit and before `done`. The supervisor sees them but can't change them. Point gates at scripts kept outside the worktree so workers can't edit them.
+- **Independent audit**: after the checks and gates pass, a different provider reviews the diff read-only for templated output, invented or mismatched content, gamed checks, and missing work. A `fail` verdict blocks the commit and returns its problems to the supervisor. An unavailable auditor never blocks progress. Configure it with `audit.sample`, or turn it off with `--no-audit`.
+- **Template detection**: a change where one sentence pattern makes up at least 20% of its prose is flagged to the supervisor and the auditor.
+- **Evidence, not verdicts**: results include a diff sample, and the supervisor role tells it to spot-check changes before relying on "passed".
+- **Operator notes**: `lite note <id> "…"` reaches the supervisor's next turn without stopping the run, and stays in every fresh session's prompt.
+- `--detach` runs the keeper in its own session with `keeper.log`, so it outlives the terminal or tool that started it.
+
 All state lives in `.agent-loop/lite/<id>/` (`goal.md`, `plan.json`, `handoff.md`, `supervisor.json`, `journal.jsonl`, `logs/`), so a fresh session or a different provider picks up from files. The run ends only when `done` verifies (every task done or dropped, clean tree, all checks pass), or on Ctrl-C. Supervisor-written checks run on the host, so use this only on repositories you trust.
 
 ## Two-pass planning
