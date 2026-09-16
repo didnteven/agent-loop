@@ -478,7 +478,18 @@ class LiteRun:
                       if name != worker_provider]
         if not candidates:
             return {"verdict": "unavailable", "reason": "no provider other than the worker's is available"}
-        auditor = candidates[0]
+        # An audit that cannot run is the loop losing its only independent check, so
+        # try the other providers before letting unaudited work through.
+        for auditor in candidates:
+            verdict = self.audit_once(state, task, auditor, prompt_parts=(diff, template))
+            if verdict.get("verdict") in ("pass", "fail"):
+                return verdict
+            self.journal("audit_unavailable", task=task["id"], auditor=auditor,
+                         reason=str(verdict.get("reason"))[:200])
+        return verdict
+
+    def audit_once(self, state, task, auditor, prompt_parts):
+        diff, template = prompt_parts
         model = self.resolve_model(auditor, "standard")[0]["model"]
         prompt = ("AUDIT REQUEST\n\nTASK " + task["id"] + ": " + (task.get("title") or "") + "\n"
                   + (task.get("prompt") or "") + "\n\nTASK CHECK: " + str(task.get("check"))
@@ -506,12 +517,13 @@ class LiteRun:
         verdict = extract_verdict(result.response) if result.status == "ok" else None
         if verdict is None:
             return {"verdict": "unavailable", "auditor": auditor,
-                    "reason": (result.error or "no verdict in reply")[-300:]}
+                    "reason": (result.error or err or "no verdict in reply")[-300:]}
         verdict["auditor"] = auditor
         verdict["problems"] = [str(item)[:400] for item in (verdict.get("problems") or [])][:15]
         return verdict
 
     def verify_passing_change(self, state, task, worker_provider):
+        # (audit_once continues below the audit() dispatcher)
         """Gates, template detection and audit for a change whose own check passed.
 
         Returns (outcome, evidence text, extra) where outcome is "passed",

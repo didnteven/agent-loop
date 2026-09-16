@@ -562,6 +562,29 @@ class LiteRunTests(unittest.TestCase):
         self.assertEqual(h.plan()["bump"]["status"], "failed")
         self.assertEqual((h.run.worktree / "app.py").read_text(), "value = 2\n")  # kept, uncommitted
 
+    def test_audit_tries_another_provider_before_giving_up(self):
+        h = Harness(self, audit=True)
+        h.run.save("config.json", {**h.run.load("config.json"),
+                                   "workers": ["claude", "codex", "antigravity"]})
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (1, "", "invalid model selection"))   # first auditor errors
+        h.audit_replies.append(lambda w: (0, json.dumps({                      # agy-shaped reply
+            "conversation_id": "c1", "status": "SUCCESS",
+            "response": json.dumps({"verdict": "fail", "problems": ["app.py: hard-coded"],
+                                    "confidence": "high"})}), ""))
+        h.run.run(max_turns=1)
+        self.assertEqual(len(h.audit_prompts), 2)                       # fell through to the second
+        self.assertEqual(h.state()["pending"][0]["outcome"], "audit_failed")
+        self.assertIn('"kind": "audit_unavailable"', h.run.path("journal.jsonl").read_text())
+
+    def test_agy_auditor_model_does_not_conflict_with_effort(self):
+        from loop.adapters import supervisor_command
+        argv = supervisor_command("antigravity", "x", "gemini-3.8-flash-high", "medium")
+        self.assertNotIn("--effort", argv)
+        self.assertIn("gemini-3.8-flash-high", argv)
+        self.assertIn("--effort", supervisor_command("antigravity", "x", None, "medium"))
+
     def test_unavailable_audit_does_not_block_progress(self):
         h = Harness(self, audit=True)
         h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))

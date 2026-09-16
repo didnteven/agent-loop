@@ -264,8 +264,13 @@ def supervisor_command(provider, prompt, model=None, effort=None, session_id=Non
         # says nobody approves plans. So agy is the one supervisor in plan mode.
         # No --disable-slash-commands here: agy ignores --mode plan when it is set
         # ("--mode plan has no effect while slash command expansion is disabled").
+        # agy rejects --effort alongside a model whose id already encodes a tier
+        # ("--model gemini-3.8-flash-high conflicts with --effort=medium").
+        tier = str(model or "").rsplit("-", 1)[-1]
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
-                "--effort", effort, "--print-timeout", "24h"]
+                "--print-timeout", "24h"]
+        if tier not in ("low", "medium", "high"):
+            argv += ["--effort", effort]
         if workspace:
             argv += ["--add-dir", str(workspace)]
         if model:
