@@ -179,10 +179,14 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
                 "--restricted", "--permission-mode", "acceptEdits",
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
+        # agy rejects --effort beside a model id that already encodes the tier.
+        tiered = str(model or "").rsplit("-", 1)[-1] in ("low", "medium", "high")
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
                 # agy's own cutoff would end a working turn and report SUCCESS;
                 # the supervisor's idle/hard timeouts decide when to stop instead.
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
+                "--disable-slash-commands", "--print-timeout", "24h"]
+        if not tiered:
+            argv += ["--effort", effort]
         if workspace:
             # Without this, agy edits files inside its own project scratch
             # directory and ignores the process working directory entirely, so

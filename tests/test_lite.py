@@ -578,6 +578,12 @@ class LiteRunTests(unittest.TestCase):
         self.assertEqual(h.state()["pending"][0]["outcome"], "audit_failed")
         self.assertIn('"kind": "audit_unavailable"', h.run.path("journal.jsonl").read_text())
 
+    def test_agy_worker_model_does_not_conflict_with_effort(self):
+        from loop.adapters import command
+        argv = command("antigravity", "p", "gemini-3.8-flash-high", None, workspace="/tmp/x")
+        self.assertNotIn("--effort", argv)
+        self.assertIn("--effort", command("antigravity", "p", None, "low", workspace="/tmp/x"))
+
     def test_agy_auditor_model_does_not_conflict_with_effort(self):
         from loop.adapters import supervisor_command
         argv = supervisor_command("antigravity", "x", "gemini-3.8-flash-high", "medium")
