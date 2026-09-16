@@ -612,6 +612,19 @@ class LiteRunTests(unittest.TestCase):
         report = keeper.template_report(varied)
         self.assertIsNotNone(report)   # same ending on all of them: reported, share decides
 
+    def test_repeated_task_failures_prompt_a_change_of_approach(self):
+        h = Harness(self)
+        failing = actions(
+            {"op": "plan", "tasks": [{"id": "bump", "title": "b", "prompt": "p", "check": "false"}]},
+            {"op": "dispatch", "task": "bump", "provider": "claude", "prompt": "go"})
+        for _ in range(3):
+            h.supervisor_replies.append(reply(failing))
+            h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.run.run(max_turns=3)
+        self.assertEqual(h.plan()["bump"]["attempts"], 3)
+        self.assertTrue(any("failed 3 attempts" in note and "split it into smaller tasks" in note
+                            for note in h.state()["notes_for_supervisor"]))
+
     def test_invalid_json_and_repeats_rotate_supervisor(self):
         h = Harness(self)
         for _ in range(4):

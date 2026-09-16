@@ -891,6 +891,17 @@ class LiteRun:
         else:
             task["status"] = "failed"
         task["last_outcome"] = outcome
+        if outcome in ("failed", "gate_failed", "audit_failed") and task["attempts"] >= 3:
+            # Three attempts on one task usually means the task is too large or the
+            # approach is wrong, not that the next model will do better.
+            state["notes_for_supervisor"].append(
+                "Task %s has now failed %d attempts across %s. Change the approach rather than "
+                "re-dispatching the same task: split it into smaller tasks (fewer files or items "
+                "each), tighten its check so a partial fix cannot pass, or fix the blocking "
+                "problem in its own task first. Its history: %s"
+                % (task["id"], task["attempts"],
+                   ", ".join(sorted({entry.split(":")[1].split("/")[0] for entry in task.get("history") or []})) or "one provider",
+                   " | ".join((task.get("history") or [])[-4:])))
         # Per-attempt evidence of which tier passes what, visible to the supervisor.
         task["history"] = (task.get("history") or []) + [
             "%s:%s/%s:%s" % (entry["tier"], provider, model or "default", outcome)]
