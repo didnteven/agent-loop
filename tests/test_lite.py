@@ -591,13 +591,26 @@ class LiteRunTests(unittest.TestCase):
         self.assertIn("gemini-3.8-flash-high", argv)
         self.assertIn("--effort", supervisor_command("antigravity", "x", None, "medium"))
 
+    def test_same_provider_audit_is_used_last_and_labelled(self):
+        h = Harness(self, audit=True)
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (1, "", "denied"))     # the independent auditor fails
+        h.audit_replies.append(lambda w: (0, claude_reply(json.dumps(   # same provider, other model
+            {"verdict": "pass", "problems": [], "confidence": "medium"})), ""))
+        h.run.run(max_turns=1)
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "passed")
+        self.assertIn("same provider", record["audit"]["independence"])
+
     def test_required_audit_blocks_when_it_cannot_run(self):
         h = Harness(self, audit=True)
         h.run.save("config.json", {**h.run.load("config.json"),
                                    "audit": {"enabled": True, "sample": 1.0, "required": True}})
         h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
         h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
-        h.audit_replies.append(lambda w: (1, "", "denied"))
+        h.audit_replies.append(lambda w: (1, "", "denied"))    # the other provider
+        h.audit_replies.append(lambda w: (1, "", "denied"))    # same-provider fallback
         h.run.run(max_turns=1)
         record = h.state()["pending"][0]
         self.assertEqual(record["outcome"], "audit_unavailable")
@@ -608,6 +621,7 @@ class LiteRunTests(unittest.TestCase):
         h = Harness(self, audit=True)
         h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
         h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (1, "", "connection reset"))
         h.audit_replies.append(lambda w: (1, "", "connection reset"))
         h.run.run(max_turns=1)
         record = h.state()["pending"][0]

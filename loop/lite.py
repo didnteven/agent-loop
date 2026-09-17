@@ -219,8 +219,8 @@ Look for concrete problems:
 - work claimed in the task but absent from the diff
 - unrelated or destructive changes
 
-Everything you need is in this message. Do not run commands or shell out; if a provider denies
-a tool, judge from the diff you were given. Fail only for problems you can point to with file
+Everything you need is in this message: the task, the diff and the checks. Do not read files,
+search, or run commands — they will be denied and you will produce nothing. Judge the diff. Fail only for problems you can point to with file
 and line evidence; do not fail for style.
 
 Reply with ONE JSON object and nothing else:
@@ -489,11 +489,22 @@ class LiteRun:
                 return verdict
             self.journal("audit_unavailable", task=task["id"], auditor=auditor,
                          reason=str(verdict.get("reason"))[:200])
+        # Last resort: a different model on the worker's own provider. Weaker than an
+        # independent one, and recorded as such, but better than no check at all.
+        worker_model = (task.get("history") or [""])[-1].split("/")[-1].split(":")[0]
+        same = [entry["model"] for entry in self.catalog()
+                if entry["provider"] == worker_provider and entry["model"] != worker_model]
+        for model in same[:1]:
+            verdict = self.audit_once(state, task, worker_provider, prompt_parts=(diff, template),
+                                      model=model)
+            if verdict.get("verdict") in ("pass", "fail"):
+                verdict["independence"] = "same provider (%s), different model" % worker_provider
+                return verdict
         return verdict
 
-    def audit_once(self, state, task, auditor, prompt_parts):
+    def audit_once(self, state, task, auditor, prompt_parts, model=None):
         diff, template = prompt_parts
-        model = self.resolve_model(auditor, "standard")[0]["model"]
+        model = model or self.resolve_model(auditor, "standard")[0]["model"]
         prompt = ("AUDIT REQUEST\n\nTASK " + task["id"] + ": " + (task.get("title") or "") + "\n"
                   + (task.get("prompt") or "") + "\n\nTASK CHECK: " + str(task.get("check"))
                   + "\nKEEPER GATES: " + json.dumps(self.config["gates"])
