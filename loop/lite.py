@@ -219,6 +219,11 @@ Look for concrete problems:
 - work claimed in the task but absent from the diff
 - unrelated or destructive changes
 
+Judge claims by kind. A procedural instruction or coaching prescription (how to run a set, how
+to label or order exercises, when to stop) is not an empirical claim and needs no citation: do
+not fail it for lacking evidence. Statements about mechanisms, anatomy, injury, safety or
+measurable outcomes do need a source or honest qualification.
+
 Everything you need is in this message: the task, the diff and the checks. Do not read files,
 search, or run commands — they will be denied and you will produce nothing. Judge the diff. Fail only for problems you can point to with file
 and line evidence; do not fail for style.
