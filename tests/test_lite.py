@@ -591,6 +591,19 @@ class LiteRunTests(unittest.TestCase):
         self.assertIn("gemini-3.8-flash-high", argv)
         self.assertIn("--effort", supervisor_command("antigravity", "x", None, "medium"))
 
+    def test_required_audit_blocks_when_it_cannot_run(self):
+        h = Harness(self, audit=True)
+        h.run.save("config.json", {**h.run.load("config.json"),
+                                   "audit": {"enabled": True, "sample": 1.0, "required": True}})
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (1, "", "denied"))
+        h.run.run(max_turns=1)
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "audit_unavailable")
+        self.assertEqual(h.plan()["bump"]["status"], "todo")          # retried, not committed
+        self.assertEqual(sh(h.run.worktree, "git", "log", "--oneline").count("\n"), 0)
+
     def test_unavailable_audit_does_not_block_progress(self):
         h = Harness(self, audit=True)
         h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))

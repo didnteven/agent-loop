@@ -67,7 +67,9 @@ DEFAULTS = {
     # After checks and gates pass, a different provider audits the diff read-only
     # for work that satisfies checks without doing the task. sample is the share of
     # passing attempts audited (1.0 = every one).
-    "audit": {"enabled": True, "sample": 1.0},
+    # required: an audit that cannot run blocks the commit instead of letting the change
+    # through. Use it when the work is the kind a model can fake convincingly.
+    "audit": {"enabled": True, "sample": 1.0, "required": False},
     # A change where one sentence pattern makes up at least this share of its prose
     # is flagged to the supervisor and auditor as likely templated.
     "template_share": 0.2,
@@ -217,7 +219,8 @@ Look for concrete problems:
 - work claimed in the task but absent from the diff
 - unrelated or destructive changes
 
-You may read files in the worktree to confirm. Fail only for problems you can point to with file
+Everything you need is in this message. Do not run commands or shell out; if a provider denies
+a tool, judge from the diff you were given. Fail only for problems you can point to with file
 and line evidence; do not fail for style.
 
 Reply with ONE JSON object and nothing else:
@@ -541,6 +544,11 @@ class LiteRun:
             return "gate_failed", gate_output, extra
         verdict = self.audit(state, task, worker_provider, diff, template)
         extra["audit"] = verdict
+        if (verdict.get("verdict") in ("unavailable", "skipped")
+                and (self.config.get("audit") or {}).get("required")
+                and verdict.get("verdict") != "skipped"):
+            return "audit_unavailable", ("No independent audit could run (%s), and this run "
+                                         "requires one before committing." % verdict.get("reason", "")), extra
         self.journal("audit_result", task=task["id"], verdict=verdict.get("verdict"),
                      problems=len(verdict.get("problems") or []))
         if verdict.get("verdict") == "fail":
@@ -898,12 +906,13 @@ class LiteRun:
             task.update(status="done", sha=self.commit(task["id"], changed))
         elif outcome == "needs_review":
             task["status"] = "review"
-        elif outcome == "provider_unavailable":
+        elif outcome in ("provider_unavailable", "audit_unavailable"):
+            # Nothing is wrong with the work; it just could not be checked yet.
             task["status"] = "todo"
         else:
             task["status"] = "failed"
         task["last_outcome"] = outcome
-        if outcome in ("failed", "gate_failed", "audit_failed") and task["attempts"] >= 3:
+        if outcome in ("failed", "gate_failed", "audit_failed", "audit_unavailable") and task["attempts"] >= 3:
             # Three attempts on one task usually means the task is too large or the
             # approach is wrong, not that the next model will do better.
             state["notes_for_supervisor"].append(
