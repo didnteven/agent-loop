@@ -600,6 +600,19 @@ class LiteRunTests(unittest.TestCase):
         self.assertIn("gemini-3.8-flash-high", argv)
         self.assertIn("--effort", supervisor_command("antigravity", "x", None, "medium"))
 
+    def test_same_provider_audit_runs_when_no_other_provider_is_free(self):
+        h = Harness(self, audit=True)
+        # Only the worker's own provider is configured, so there is no independent auditor.
+        h.run.save("config.json", {**h.run.load("config.json"), "workers": ["claude"]})
+        h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))
+        h.worker_actions.append(worker_writes({"app.py": "value = 2\n"}))
+        h.audit_replies.append(lambda w: (0, claude_reply(json.dumps(
+            {"verdict": "fail", "problems": ["app.py: hard-coded"], "confidence": "medium"})), ""))
+        h.run.run(max_turns=1)
+        record = h.state()["pending"][0]
+        self.assertEqual(record["outcome"], "audit_failed")
+        self.assertIn("same provider", record["audit"]["independence"])
+
     def test_same_provider_audit_is_used_last_and_labelled(self):
         h = Harness(self, audit=True)
         h.supervisor_replies.append(reply(PLAN_AND_DISPATCH))

@@ -485,8 +485,7 @@ class LiteRun:
             return {"verdict": "skipped", "reason": "not sampled"}
         candidates = [name for name in self.available(self.config["workers"], state)
                       if name != worker_provider]
-        if not candidates:
-            return {"verdict": "unavailable", "reason": "no provider other than the worker's is available"}
+        verdict = {"verdict": "unavailable", "reason": "no provider other than the worker's is available"}
         # An audit that cannot run is the loop losing its only independent check, so
         # try the other providers before letting unaudited work through.
         for auditor in candidates:
