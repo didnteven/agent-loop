@@ -186,9 +186,13 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("--sandbox", antigravity)
         self.assertIn("--sandbox", command("antigravity", "work", sandbox=True))
 
-    def test_antigravity_model_tier_selects_matching_effort(self):
+    def test_antigravity_tiered_model_carries_its_own_effort(self):
+        # agy refuses "--model gemini-3.1-pro-high --effort high": the tier is in the id.
         argv = command("antigravity", "work", "gemini-3.1-pro-high")
-        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertIn("gemini-3.1-pro-high", argv)
+        self.assertNotIn("--effort", argv)
+        untiered = command("antigravity", "work", "gemini-3.1-pro", "medium")
+        self.assertEqual(untiered[untiered.index("--effort") + 1], "medium")
 
     def test_timeout_is_bounded(self):
         code, _, _ = run_process(["python3", "-c", "import time; time.sleep(10)"], tempfile.gettempdir(), 0.05)

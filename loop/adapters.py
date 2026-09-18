@@ -179,10 +179,14 @@ def command(provider, prompt, model=None, effort=None, worker=True, sandbox=Fals
                 "--restricted", "--permission-mode", "acceptEdits",
                 "--permission-prompts", "none", "--effort", effort]
     elif provider == "antigravity":
+        # agy rejects --effort beside a model id that already encodes the tier.
+        tiered = str(model or "").rsplit("-", 1)[-1] in ("low", "medium", "high")
         argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "accept-edits",
                 # agy's own cutoff would end a working turn and report SUCCESS;
                 # the supervisor's idle/hard timeouts decide when to stop instead.
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
+                "--disable-slash-commands", "--print-timeout", "24h"]
+        if not tiered:
+            argv += ["--effort", effort]
         if workspace:
             # Without this, agy edits files inside its own project scratch
             # directory and ignores the process working directory entirely, so
@@ -221,10 +225,11 @@ SYSTEM_INSTRUCTIONS = ("claude", "codex")
 
 def supervisor_command(provider, prompt, model=None, effort=None, session_id=None,
                        workspace=None, instructions=None):
-    """A read-only, resumable supervisor session. Never a plan/approval mode.
+    """A read-only, resumable supervisor session.
 
-    Plan modes tell the model it is drafting for a human to approve, so it waits
-    instead of acting. Read-only comes from the tool set or sandbox instead.
+    Claude's plan mode tells the model it is drafting for a human to approve, so
+    it waits instead of acting; claude and codex get read-only from their tool
+    set or sandbox instead. agy is the exception (see below).
     ``instructions`` is the supervisor role, sent as system/developer
     instructions on every call where the CLI supports it (SYSTEM_INSTRUCTIONS);
     other providers must carry it in the prompt. ``session_id`` resumes the
@@ -257,10 +262,19 @@ def supervisor_command(provider, prompt, model=None, effort=None, session_id=Non
         else:
             argv = ["codex", "exec", *options, prompt]
     elif provider == "antigravity":
-        # No --mode and no permission bypass: headless agy then denies writes and
-        # commands on its own (measured), while reads still work.
-        argv = ["agy", "-p", prompt, "--output-format", "json",
-                "--disable-slash-commands", "--effort", effort, "--print-timeout", "24h"]
+        # Measured: headless agy's default mode denies every tool, reads included,
+        # and then produces no output. Unlike claude, agy's plan mode allows reads,
+        # blocks writes, and still answers with the JSON actions when the prompt
+        # says nobody approves plans. So agy is the one supervisor in plan mode.
+        # No --disable-slash-commands here: agy ignores --mode plan when it is set
+        # ("--mode plan has no effect while slash command expansion is disabled").
+        # agy rejects --effort alongside a model whose id already encodes a tier
+        # ("--model gemini-3.8-flash-high conflicts with --effort=medium").
+        tier = str(model or "").rsplit("-", 1)[-1]
+        argv = ["agy", "-p", prompt, "--output-format", "json", "--mode", "plan",
+                "--print-timeout", "24h"]
+        if tier not in ("low", "medium", "high"):
+            argv += ["--effort", effort]
         if workspace:
             argv += ["--add-dir", str(workspace)]
         if model:

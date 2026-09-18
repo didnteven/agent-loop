@@ -119,6 +119,18 @@ def main():
         target.add_argument("--reset-at-tokens", type=int,
                             help="Start a fresh supervisor session above this context size")
         target.add_argument("--max-turns", type=int, help="Stop after this many supervisor turns")
+        target.add_argument("--gate", action="append", default=[], metavar="COMMAND",
+                            help="Keeper-owned acceptance command required before every commit and done")
+        target.add_argument("--no-audit", action="store_true",
+                            help="Skip the independent audit of passing changes")
+        target.add_argument("--detach", action="store_true",
+                            help="Run the keeper in its own session, logging to the run directory")
+    lite_note = lite_sub.add_parser("note", help="Send a note to a running (or paused) run's supervisor")
+    lite_note.add_argument("run_id")
+    lite_note.add_argument("text")
+    lite_gate = lite_sub.add_parser("gate", help="Add a keeper-owned acceptance gate to a run")
+    lite_gate.add_argument("run_id")
+    lite_gate.add_argument("command")
     lite_status = lite_sub.add_parser("status")
     lite_status.add_argument("run_id")
     lite_tail = lite_sub.add_parser("tail", help="Follow the run journal")
@@ -356,6 +368,10 @@ def lite_options(args):
         options["catalog"] = catalog
     if args.setup:
         options["setup"] = args.setup
+    if args.gate:
+        options["gates"] = args.gate
+    if args.no_audit:
+        options["audit"] = {"enabled": False}
     return {key: value for key, value in options.items() if value is not None}
 
 
@@ -369,6 +385,14 @@ def lite_main(args):
     if args.lite_command == "status":
         print(run.status())
         return 0
+    if args.lite_command == "note":
+        run.note(args.text)
+        print("Queued for the supervisor's next turn.")
+        return 0
+    if args.lite_command == "gate":
+        run.add_gate(args.command)
+        print("Gate added; it applies to the next commit and to done.")
+        return 0
     if args.lite_command == "tail":
         with run.path("journal.jsonl").open() as stream:
             while True:
@@ -379,8 +403,21 @@ def lite_main(args):
                     time.sleep(0.5)
     if args.lite_command == "resume":
         options = lite_options(args)
+        if options.get("gates"):
+            options["gates"] = run.config["gates"] + [g for g in options["gates"] if g not in run.config["gates"]]
         if options:
             run.save("config.json", {**run.load("config.json", {}), **options})
+    if args.detach:
+        import subprocess
+        import sys as _sys
+        log = run.path("keeper.log").open("ab")
+        argv = [_sys.executable, "-m", "loop", "--repo", str(run.repo), "lite", "resume", run.id]
+        if args.max_turns:
+            argv += ["--max-turns", str(args.max_turns)]
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                start_new_session=True)
+        print("Keeper running detached (pid %d); log: %s" % (proc.pid, run.path("keeper.log")))
+        return 0
     state = run.run(args.max_turns)
     print(run.status())
     return 0 if state["finished"] else 3

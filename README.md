@@ -103,7 +103,7 @@ python3 -m loop --repo /path/to/repo lite resume <id>
 
 There are three layers:
 
-- **Supervisor:** a cloud model running a read-only, resumable CLI session, never in a plan or approval mode (claude `--tools Read,Grep,Glob`, codex `sandbox_mode="read-only"`, agy's default headless mode, which denies writes). The supervisor role is sent as system/developer instructions (claude `--append-system-prompt`, codex `developer_instructions`), or in the prompt for agy. Each turn it gets the goal, plan, handoff notes and new worker results, and replies with JSON actions: `plan`, `dispatch`, `accept`, `discard`, `note`, `wait`, `done`. Any file change it makes is reverted.
+- **Supervisor:** a cloud model running a read-only, resumable CLI session, using each CLI's working read-only setup: claude `--tools Read,Grep,Glob` (its plan mode made the supervisor wait for approval), codex `sandbox_mode="read-only"`, and agy `--mode plan` (agy's default headless mode denies reads too; its plan mode reads, blocks writes, and still replies). The supervisor role is sent as system/developer instructions (claude `--append-system-prompt`, codex `developer_instructions`), or in the prompt for agy. Each turn it gets the goal, plan, handoff notes and new worker results, and replies with JSON actions: `plan`, `dispatch`, `accept`, `discard`, `note`, `wait`, `done`. Any file change it makes is reverted.
 - **Workers:** full coding agents in `.agent-loop/worktrees/lite-<id>` (branch `lite/<id>`). They can edit any file and run builds or installs; only delegation is disabled. When a task's `check` passes, all changes are committed. When it fails, the changes stay uncommitted and the supervisor decides what to do next.
 - **Keeper:** Python rules (`loop/keeper.py`), not a model, decide after every turn:
   - **Switch** supervisors when quota or auth runs out.
@@ -126,6 +126,15 @@ Workers can only use models from a tiered catalog, and the supervisor picks a ti
 - **Retired models:** entries that `agy models` or Codex's model cache no longer list are dropped at startup.
 - **History:** each task records its tier, model and outcome per attempt.
 - **Codex supervisor:** runs on `gpt-5.6-sol` and moves to `gpt-6-astra` only for the fresh session after the keeper finds it stuck. `--setup` commands, such as dependency installs, run once per worktree without a model call. `lite status` shows estimated spend split into supervisor and worker.
+
+**Keeping workers honest.** Workers optimise for passing checks, and a supervisor that trusts "passed" gets gamed. In a long real run, workers stamped claims with generic reasons, swapped in templated reasons, appended ids to make templates look unique, left stale dates on "rewritten" work, and cited DOIs belonging to unrelated papers, all while the supervisor's checks passed. The keeper now defends against this independently of the supervisor:
+
+- **Gates** (`--gate COMMAND`, or `lite gate <id> COMMAND` mid-run): keeper-owned commands that must pass, in addition to each task's own check, before any commit and before `done`. The supervisor sees them but can't change them. Point gates at scripts kept outside the worktree so workers can't edit them.
+- **Independent audit**: after the checks and gates pass, a different provider reviews the diff read-only for templated output, invented or mismatched content, gamed checks, and missing work. A `fail` verdict blocks the commit and returns its problems to the supervisor. An unavailable auditor never blocks progress. Configure it with `audit.sample`, or turn it off with `--no-audit`.
+- **Template detection**: a change where one sentence pattern makes up at least 20% of its prose is flagged to the supervisor and the auditor.
+- **Evidence, not verdicts**: results include a diff sample, and the supervisor role tells it to spot-check changes before relying on "passed".
+- **Operator notes**: `lite note <id> "…"` reaches the supervisor's next turn without stopping the run, and stays in every fresh session's prompt.
+- `--detach` runs the keeper in its own session with `keeper.log`, so it outlives the terminal or tool that started it.
 
 All state lives in `.agent-loop/lite/<id>/` (`goal.md`, `plan.json`, `handoff.md`, `supervisor.json`, `journal.jsonl`, `logs/`), so a fresh session or a different provider picks up from files. The run ends only when `done` verifies (every task done or dropped, clean tree, all checks pass), or on Ctrl-C. Supervisor-written checks run on the host, so use this only on repositories you trust.
 
