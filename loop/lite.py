@@ -263,6 +263,7 @@ class LiteRun:
         self._limits_cache = {}
         self.models = models or available_models
         self._catalog = None
+        self._catalog_signature = None
 
     # ---- durable state -------------------------------------------------
     def path(self, name):
@@ -609,9 +610,16 @@ class LiteRun:
         state["inbox_seen"] = len(lines)
 
     def catalog(self):
-        """Worker catalog entries still offered by the installed CLIs."""
-        if self._catalog is None:
-            entries = self.config["catalog"] or DEFAULT_CATALOG
+        """Worker catalog entries still offered by the installed CLIs.
+
+        Cached per configured catalog, not per process: editing config.json mid-run
+        (adding a provider that came back from its limit) takes effect on the next
+        turn instead of needing a restart.
+        """
+        entries = self.config["catalog"] or DEFAULT_CATALOG
+        signature = json.dumps(entries, sort_keys=True)
+        if self._catalog is None or self._catalog_signature != signature:
+            self._catalog_signature = signature
             offered = {}
             for provider in {entry["provider"] for entry in entries}:
                 try:

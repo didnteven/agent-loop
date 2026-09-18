@@ -454,6 +454,15 @@ class LiteRunTests(unittest.TestCase):
         notes = h.state()["notes_for_supervisor"]
         self.assertTrue(any("gpt-6-astra" in note and "not in the codex" in note for note in notes))
 
+    def test_catalog_follows_a_config_change_without_a_restart(self):
+        h = Harness(self)
+        self.assertEqual(h.run.resolve_model("claude", "standard")[0]["model"], "claude-sonnet-5")
+        h.run.save("config.json", {**h.run.load("config.json"),
+                                   "catalog": [{"provider": "claude", "tier": "standard",
+                                                "model": "claude-haiku-4-5-20251001"}]})
+        self.assertEqual(h.run.resolve_model("claude", "standard")[0]["model"],
+                         "claude-haiku-4-5-20251001")
+
     def test_catalog_drops_models_the_cli_no_longer_offers(self):
         h = Harness(self)
         h.run.models = lambda provider: ({"gemini-3.8-flash-low", "gemini-3.8-flash-high"}
