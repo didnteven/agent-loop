@@ -68,6 +68,10 @@ def template_report(added_lines, minimum=10):
         value = max((a or b for a, b in literals), key=len) if literals else stripped
         if value.startswith(("|", "#", "-", "{", "}", "[", "]")) or value.count(";") >= 2:
             continue
+        # Paths, ids and urls repeat by nature in reports and manifests; repetition
+        # there says nothing about whether the prose was written per item.
+        if re.match(r"^[\w./-]+$", value) or value.count("/") >= 2 or "://" in value:
+            continue
         if skeleton_keys(value):
             prose.append(value)
     if len(prose) < minimum:

@@ -224,7 +224,9 @@ to label or order exercises, when to stop) is not an empirical claim and needs n
 not fail it for lacking evidence. Statements about mechanisms, anatomy, injury, safety or
 measurable outcomes do need a source or honest qualification.
 
-Everything you need is in this message: the task, the diff and the checks. Do not read files,
+The diff you are shown is a sample: long files are truncated and some may be omitted.
+Truncation is not evidence of a problem, and "I cannot see the whole diff" is not a finding.
+Judge what is shown. Everything you need is in this message: the task, the diff and the checks. Do not read files,
 search, or run commands — they will be denied and you will produce nothing. Judge the diff. Fail only for problems you can point to with file
 and line evidence; do not fail for style.
 
