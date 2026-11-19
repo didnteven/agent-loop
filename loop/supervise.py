@@ -71,6 +71,14 @@ def apply_goal_template(goal, template_path=GOAL_TEMPLATE):
     return template.replace('{instructions}', goal.strip())
 
 
+def read_pr(path):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get('number') else None
+
+
 def read_activity(path):
     try:
         data = json.loads(path.read_text())
@@ -768,7 +776,8 @@ class Fleet:
 
     def status(self):
         return [{'id': task['id'], 'repo': task['repo'], 'worktree': str(run.worktree), 'branch': run.branch,
-                 **run.state(), 'activity': read_activity(run.dir / 'activity.json')} for task, run in self.runs()]
+                 **run.state(), 'activity': read_activity(run.dir / 'activity.json'),
+                 'pr': read_pr(run.dir / 'pr.json')} for task, run in self.runs()]
 
     def note(self, task_id, text):
         for task, run in self.runs():

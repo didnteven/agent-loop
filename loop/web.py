@@ -34,6 +34,7 @@ from .usage import agent_usage, combine as combine_usage
 from .supervise import Fleet, EFFORTS
 from .worker import workspace_lock_path, legacy_workspace_lock_path, terminal_owner_path, process_identity, require_unreserved_workspace
 from .tmux_session import TmuxSession
+from . import pr_status
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / 'web'
@@ -479,6 +480,27 @@ class Controller:
                     pass  # Ownership uncertainty never permits a competing worker.
                 await asyncio.sleep(2)
         self.guardian_task = asyncio.create_task(watch())
+        self.pr_task = asyncio.create_task(self.watch_prs())
+
+    def pr_agents(self):
+        if not self.primary_index.exists():
+            return []
+        agents = []
+        for task, run in Fleet(self.supervisor()['home']).runs():
+            if task.get('delete_requested') or not run.worktree.exists():
+                continue
+            agents.append({'repo': task['repo'], 'worktree': run.worktree, 'path': run.dir / 'pr.json',
+                           'activity': pr_status.turn_activity(run.dir, run.state())})
+        return agents
+
+    async def watch_prs(self):
+        # Cheap local checks every 30s; GitHub is asked only when pr_status says an answer may have changed.
+        while not self.stopping:
+            try:
+                await asyncio.to_thread(lambda: pr_status.refresh(self.pr_agents()))
+            except Exception:
+                pass
+            await asyncio.sleep(30)
 
     def projects(self):
         if not self.project_index.exists():

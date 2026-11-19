@@ -122,6 +122,15 @@ function agentName(task) {
 function currentFleet() { return fleets.find(f => f.id === selectedFleet); }
 function currentTask() { return currentFleet()?.tasks.find(t => t.id === selectedTask); }
 function taskURL() { return `/fleets/${encodeURIComponent(selectedFleet)}/tasks/${encodeURIComponent(selectedTask)}`; }
+function prPill(pr) {
+  if(!pr || !/^https:\/\//.test(pr.url||'')) return '';
+  const label={OPEN:'PR open',DRAFT:'PR draft',MERGED:'Merged',CLOSED:'PR closed'}[pr.state]; if(!label) return '';
+  return `<span class="pill pr ${escapeHTML(pr.state.toLowerCase())}" role="link" data-pr-url="${escapeHTML(pr.url)}" title="Open pull request #${Number(pr.number)}">${label} #${Number(pr.number)}</span>`;
+}
+document.addEventListener('click',event=>{
+  const link=event.target.closest?.('[data-pr-url]'); if(!link) return;
+  event.preventDefault(); event.stopPropagation(); window.open(link.dataset.prUrl,'_blank','noopener,noreferrer');
+},true);
 function pill(state) { return `<span class="pill ${escapeHTML(state)}">${escapeHTML(state)}</span>`; }
 function countdown(timestamp) {
   const seconds = Math.max(0, Math.ceil(timestamp - Date.now()/1000));
@@ -177,7 +186,7 @@ function render() {
   });
   const openAgentMenu = $('workers').querySelector('details[open]')?.dataset.agentMenu;
   $('workers').innerHTML = visibleTasks.map(t => {
-    return `<article class="worker-card ${t.id === selectedTask ? 'selected' : ''}" data-task="${escapeHTML(t.id)}"><button class="worker-select" aria-label="Open agent ${escapeHTML(agentName(t))}"><div class="worker-top"><strong>${escapeHTML(agentName(t))}</strong>${pill(t.signal || t.state)}</div><span class="repo" title="${escapeHTML(t.repo)}">${escapeHTML(t.repo.split(/[\\/]/).filter(Boolean).pop())}</span><div class="goal">${query && contentHits[t.id] && contentHits[t.id].where !== 'goal' ? `<em>In ${escapeHTML(contentHits[t.id].where)}:</em> …${escapeHTML(contentHits[t.id].text)}…` : escapeHTML(t.delete_requested ? (t.delete_error ? 'Cleanup failed: '+t.delete_error : 'Deletion queued') : t.state === 'waiting' && t.wait_reason ? t.wait_reason : t.goal || t.next_action)}</div></button><details class="agent-card-menu" data-agent-menu="${escapeHTML(t.id)}" ${openAgentMenu === t.id ? 'open' : ''}><summary aria-label="Options for ${escapeHTML(agentName(t))}">⋯</summary><div class="agent-card-actions"><button data-archive="${escapeHTML(t.id)}" ${t.delete_requested || t.terminal_requested ? 'disabled' : ''}>Archive agent</button><button class="danger" data-delete="${escapeHTML(t.id)}" ${t.delete_requested && !t.delete_error ? 'disabled' : ''}>${t.delete_error ? 'Retry cleanup' : 'Delete &amp; clean up'}</button></div></details></article>`;
+    return `<article class="worker-card ${t.id === selectedTask ? 'selected' : ''}" data-task="${escapeHTML(t.id)}"><button class="worker-select" aria-label="Open agent ${escapeHTML(agentName(t))}"><div class="worker-top"><strong>${escapeHTML(agentName(t))}</strong><span class="worker-pills">${prPill(t.pr)}${pill(t.signal || t.state)}</span></div><span class="repo" title="${escapeHTML(t.repo)}">${escapeHTML(t.repo.split(/[\\/]/).filter(Boolean).pop())}</span><div class="goal">${query && contentHits[t.id] && contentHits[t.id].where !== 'goal' ? `<em>In ${escapeHTML(contentHits[t.id].where)}:</em> …${escapeHTML(contentHits[t.id].text)}…` : escapeHTML(t.delete_requested ? (t.delete_error ? 'Cleanup failed: '+t.delete_error : 'Deletion queued') : t.state === 'waiting' && t.wait_reason ? t.wait_reason : t.goal || t.next_action)}</div></button><details class="agent-card-menu" data-agent-menu="${escapeHTML(t.id)}" ${openAgentMenu === t.id ? 'open' : ''}><summary aria-label="Options for ${escapeHTML(agentName(t))}">⋯</summary><div class="agent-card-actions"><button data-archive="${escapeHTML(t.id)}" ${t.delete_requested || t.terminal_requested ? 'disabled' : ''}>Archive agent</button><button class="danger" data-delete="${escapeHTML(t.id)}" ${t.delete_requested && !t.delete_error ? 'disabled' : ''}>${t.delete_error ? 'Retry cleanup' : 'Delete &amp; clean up'}</button></div></details></article>`;
   }).join('') || '<p class="list-empty">No matching agents.</p>';
   $('workers').querySelectorAll('[data-task]').forEach(card => {
     card.querySelector('.worker-select').onclick = () => chooseTask(card.dataset.task);

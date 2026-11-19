@@ -515,3 +515,12 @@ mark.find-hit.current{background:rgba(255,140,0,.7)}
 .pill.idle { color: var(--info); border-color: color-mix(in srgb, var(--info) 45%, transparent); background: var(--info-soft); }
 .pill.needs { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: var(--warn-soft); }
 .worker-card:has(.pill.needs) { border-left-color: var(--warn); }
+
+.worker-pills{display:inline-flex;gap:4px;align-items:center;flex-shrink:0}
+.pill.pr{cursor:pointer}
+.pill.pr::before{display:none}
+.pill.pr:hover{text-decoration:underline}
+.pill.pr.open{color:var(--info);border-color:color-mix(in srgb,var(--info) 45%,transparent);background:var(--info-soft)}
+.pill.pr.draft{color:var(--muted,#999);border-color:color-mix(in srgb,currentColor 35%,transparent)}
+.pill.pr.merged{color:#b18cff;border-color:color-mix(in srgb,#b18cff 45%,transparent);background:color-mix(in srgb,#b18cff 12%,transparent)}
+.pill.pr.closed{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent);background:var(--warn-soft)}
